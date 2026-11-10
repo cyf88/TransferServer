@@ -139,8 +139,10 @@ void NetworkReceiver::stop() {
         close(_sock);
         _sock = -1;
     }
-
-
+    // 必须 join 接收线程：否则该线程在自己 lambda 末尾释放最后一个 shared_ptr 引用，
+    // 触发析构时 _recvThread 仍 joinable，导致 std::terminate。
+    if (_recvThread.joinable())
+        _recvThread.join();
 }
 
 // TCP 接收循环：只 accept 一次，连接断开后退出
