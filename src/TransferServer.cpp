@@ -70,8 +70,13 @@ bool TransferServer::start(const TransferConfig &cfg)
         BLOG(info) << "[TransferServer] decrypt enabled, vkek_version=" << _cfg.vkekVersion;
     }
 
-    // ===== 第三步：创建发送器 =====
-    _psSender = std::make_unique<PSSender>(_cfg.outProtocol, _cfg.dstIp, _cfg.dstPort, _cfg.ssrc);
+    // ===== 第三步：创建发送器（saveToFile 模式不对外推送，跳过）=====
+    if (!_cfg.saveToFile) {
+        _psSender = std::make_unique<PSSender>(_cfg.outProtocol, _cfg.dstIp, _cfg.dstPort, _cfg.ssrc);
+    }
+
+    // ===== 打开保存文件 =====
+    openSaveFiles();
 
     // ===== 第四步：搭建回调链 =====
     // RTP 输入 -> RtpReceiver
@@ -83,8 +88,9 @@ bool TransferServer::start(const TransferConfig &cfg)
         }
     });
 
-    // RTP 重组出 PS -> PsDemuxer 解复用出 ES
+    // RTP 重组出 PS -> 保存接收流(PS) + PsDemuxer 解复用出 ES
     _rtpReceiver.setPsCallback([this](const uint8_t *psData, size_t psLen) {
+        writeRecvStream(psData, psLen);
         _demuxer.input(psData, psLen);
     });
 
@@ -94,6 +100,7 @@ bool TransferServer::start(const TransferConfig &cfg)
         if (!isVideoCodec(codecid)) {
             return; // 忽略音频及其他非视频流
         }
+        _inputCodecid = codecid; // 记录输入编码类型
         bool keyFrame = (flags & MPEG_FLAG_IDR_FRAME) != 0;
         // 只有 SVAC 视频涉及加解密
         if (_cfg.decrypt && codecid == PSI_STREAM_VIDEO_SVAC) {
@@ -114,10 +121,18 @@ bool TransferServer::start(const TransferConfig &cfg)
         _sendThread = std::thread(&TransferServer::sendLoop, this);
     }
 
-    BLOG(info) << "[TransferServer] started: recv " << _cfg.recvIp << ":" << _cfg.recvPort
-               << " -> send " << _cfg.dstIp << ":" << _cfg.dstPort
-               << ", decrypt=" << (_cfg.decrypt ? "on" : "off")
-               << ", transcode=" << (_cfg.transcode ? _cfg.transcodeFormat : "off");
+    if (_cfg.saveToFile) {
+        BLOG(info) << "[TransferServer] started(save): recv " << _cfg.recvIp << ":" << _cfg.recvPort
+                   << " -> recv_file " << _cfg.recvFilePath
+                   << " / out_file " << _cfg.outFilePath
+                   << ", decrypt=" << (_cfg.decrypt ? "on" : "off")
+                   << ", transcode=" << (_cfg.transcode ? _cfg.transcodeFormat : "off");
+    } else {
+        BLOG(info) << "[TransferServer] started: recv " << _cfg.recvIp << ":" << _cfg.recvPort
+                   << " -> send " << _cfg.dstIp << ":" << _cfg.dstPort
+                   << ", decrypt=" << (_cfg.decrypt ? "on" : "off")
+                   << ", transcode=" << (_cfg.transcode ? _cfg.transcodeFormat : "off");
+    }
     return true;
 }
 
@@ -128,8 +143,62 @@ void TransferServer::stop()
         _networkReceiver->stop();
     if (_sendThread.joinable())
         _sendThread.join();
+    closeSaveFiles();
     if (wasRunning)
         BLOG(info) << "[TransferServer] stopped";
+}
+
+void TransferServer::openSaveFiles()
+{
+    if (!_cfg.saveToFile)
+        return;
+
+    std::lock_guard<std::mutex> lk(_fileMutex);
+    if (!_cfg.recvFilePath.empty()) {
+        _recvFile = fopen(_cfg.recvFilePath.c_str(), "wb");
+        if (!_recvFile)
+            BLOG(error) << "[TransferServer] open recv file failed: " << _cfg.recvFilePath;
+    }
+    if (!_cfg.outFilePath.empty()) {
+        _outFile = fopen(_cfg.outFilePath.c_str(), "wb");
+        if (!_outFile)
+            BLOG(error) << "[TransferServer] open out file failed: " << _cfg.outFilePath;
+    }
+}
+
+void TransferServer::writeRecvStream(const uint8_t *data, size_t len)
+{
+    if (!_cfg.saveToFile || !data || len == 0)
+        return;
+    std::lock_guard<std::mutex> lk(_fileMutex);
+    if (_recvFile) {
+        fwrite(data, 1, len, _recvFile);
+        fflush(_recvFile);
+    }
+}
+
+void TransferServer::writeOutStream(const uint8_t *data, size_t len)
+{
+    if (!_cfg.saveToFile || !data || len == 0)
+        return;
+    std::lock_guard<std::mutex> lk(_fileMutex);
+    if (_outFile) {
+        fwrite(data, 1, len, _outFile);
+        fflush(_outFile);
+    }
+}
+
+void TransferServer::closeSaveFiles()
+{
+    std::lock_guard<std::mutex> lk(_fileMutex);
+    if (_recvFile) {
+        fclose(_recvFile);
+        _recvFile = nullptr;
+    }
+    if (_outFile) {
+        fclose(_outFile);
+        _outFile = nullptr;
+    }
 }
 
 void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool keyFrame)
@@ -138,7 +207,8 @@ void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool k
         return;
 
     if (!_cfg.transcode) {
-        // 透传：按原始编码重新封装
+        // 透传：保存裸流(ES) + (可选) 按原始编码重新封装推送
+        writeOutStream(data, len);
         if (!_psSender)
             return;
         _pts += kPtsIncrement;
@@ -221,7 +291,11 @@ void TransferServer::sendLoop()
 
             if (enc && !encoderCallbackSet) {
                 enc->setOnEncoded([this, streamType](const Frame &encoded) {
-                    if (!_psSender || encoded.data.empty())
+                    if (encoded.data.empty())
+                        return;
+                    // 保存转码后的裸流(ES)
+                    writeOutStream(encoded.data.data(), encoded.data.size());
+                    if (!_psSender)
                         return;
                     std::vector<uint8_t> buf(encoded.data.size());
                     memcpy(buf.data(), encoded.data.data(), encoded.data.size());

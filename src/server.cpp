@@ -1,38 +1,36 @@
 /**
  * TransferServer HTTP 服务
  *
- * 通过 HTTP 接口下发转发配置，控制解密 / 转码流水线。
+ * 通过 HTTP 接口下发转发配置，控制解密 / 转码流水线，支持多路并发转发。
  *
  * 接口：
- *   POST /transfer/start  启动转发（JSON body 或 query 参数）
+ *   POST /transfer/start  启动一路转发（JSON body 或 query 参数），返回 id 与 recv_port
  *         JSON 示例：
  *         {
- *           "url": "tcp://127.0.0.1:12345",
+ *           "src_protocol": "tcp",
  *           "dst_ip": "192.168.1.1",
  *           "dst_port": 554,
  *           "decrypt": true,
  *           "transcode": true,
  *           "transcode_format": "h264",
- *           "vkek": "1234567887654321",
+ *           "vkek": "AQIDBAUGBwgJCgsMDQ4PEA==",
  *           "vkek_version": "1.0"
  *         }
- *   POST /transfer/stop   停止转发
- *   GET  /transfer/status 查询状态
+ *   POST /transfer/save   保存接收流与解密/转码后流到文件（不对外推送）
+ *   POST /transfer/stop   停止转发（可选 ?id=N 停止指定路，缺省停止全部）
+ *   GET  /transfer/status 查询状态（可选 ?id=N 查询指定路，缺省返回全部）
+ *   GET  /transfer/transcode 查询当前运行的转码服务（仅转码路）
  *
  * 端口：默认 8080，可通过首个参数指定，如 ./TransferServer 9000
  */
 #include "TransferServer.h"
 #include "logger.h"
-#include "util.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "httplib.h"
+#include "json.hpp"
 
 #include <algorithm>
-#include <csignal>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -40,236 +38,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
+#include <utility>
 
-static volatile sig_atomic_t g_quit = 0;
-static void sigint_handler(int) { g_quit = 1; }
+using nlohmann::json;
 
-// ==================== URL / query 解析 ====================
-
-static std::string urldecode(const std::string &s)
-{
-    std::string out;
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '%' && i + 2 < s.size()) {
-            int v = 0;
-            sscanf(s.c_str() + i + 1, "%2x", &v);
-            out += static_cast<char>(v);
-            i += 2;
-        } else if (s[i] == '+') {
-            out += ' ';
-        } else {
-            out += s[i];
-        }
-    }
-    return out;
-}
-
-static std::map<std::string, std::string> parseQuery(const std::string &s)
-{
-    std::map<std::string, std::string> m;
-    size_t i = 0;
-    while (i < s.size()) {
-        size_t eq = s.find('=', i);
-        if (eq == std::string::npos) break;
-        size_t amp = s.find('&', eq + 1);
-        if (amp == std::string::npos) amp = s.size();
-        std::string key = urldecode(s.substr(i, eq - i));
-        std::string val = urldecode(s.substr(eq + 1, amp - eq - 1));
-        if (!key.empty()) m[key] = val;
-        i = amp + 1;
-    }
-    return m;
-}
-
-// ==================== 极简 JSON 解析（仅一层扁平对象） ====================
-
-struct JsonValue {
-    enum Type { Null, String, Number, Bool } type = Null;
-    std::string str;
-    double num = 0;
-    bool boolean = false;
-};
-
-static void skipWs(const std::string &s, size_t &i)
-{
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
-}
-
-static bool parseJsonString(const std::string &s, size_t &i, std::string &out)
-{
-    if (i >= s.size() || s[i] != '"') return false;
-    ++i;
-    out.clear();
-    while (i < s.size()) {
-        char c = s[i];
-        if (c == '"') { ++i; return true; }
-        if (c == '\\' && i + 1 < s.size()) {
-            char n = s[++i];
-            switch (n) {
-                case 'n': out += '\n'; break;
-                case 't': out += '\t'; break;
-                case 'r': out += '\r'; break;
-                case 'b': out += '\b'; break;
-                case 'f': out += '\f'; break;
-                case '"': out += '"'; break;
-                case '\\': out += '\\'; break;
-                case '/': out += '/'; break;
-                default: out += n; break;
-            }
-            ++i;
-        } else {
-            out += c;
-            ++i;
-        }
-    }
-    return false;
-}
-
-static bool parseJsonNumber(const std::string &s, size_t &i, double &out)
-{
-    size_t start = i;
-    if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
-    bool hasDigit = false;
-    while (i < s.size() && isdigit((unsigned char)s[i])) { ++i; hasDigit = true; }
-    if (i < s.size() && s[i] == '.') {
-        ++i;
-        while (i < s.size() && isdigit((unsigned char)s[i])) { ++i; hasDigit = true; }
-    }
-    if (!hasDigit) { i = start; return false; }
-    out = atof(s.substr(start, i - start).c_str());
-    return true;
-}
-
-static bool parseJsonValue(const std::string &s, size_t &i, JsonValue &v)
-{
-    skipWs(s, i);
-    if (i >= s.size()) return false;
-    char c = s[i];
-    if (c == '"') {
-        v.type = JsonValue::String;
-        return parseJsonString(s, i, v.str);
-    }
-    if (c == '-' || c == '+' || isdigit((unsigned char)c)) {
-        v.type = JsonValue::Number;
-        return parseJsonNumber(s, i, v.num);
-    }
-    if (s.compare(i, 4, "true") == 0) { v.type = JsonValue::Bool; v.boolean = true; i += 4; return true; }
-    if (s.compare(i, 5, "false") == 0) { v.type = JsonValue::Bool; v.boolean = false; i += 5; return true; }
-    if (s.compare(i, 4, "null") == 0) { v.type = JsonValue::Null; i += 4; return true; }
-    return false;
-}
-
-static bool parseJsonObject(const std::string &s, std::map<std::string, JsonValue> &out)
-{
-    size_t i = 0;
-    skipWs(s, i);
-    if (i >= s.size() || s[i] != '{') return false;
-    ++i;
-    skipWs(s, i);
-    if (i < s.size() && s[i] == '}') { ++i; return true; }
-    while (i < s.size()) {
-        skipWs(s, i);
-        std::string key;
-        if (!parseJsonString(s, i, key)) return false;
-        skipWs(s, i);
-        if (i >= s.size() || s[i] != ':') return false;
-        ++i;
-        JsonValue v;
-        if (!parseJsonValue(s, i, v)) return false;
-        out[key] = v;
-        skipWs(s, i);
-        if (i < s.size() && s[i] == ',') { ++i; continue; }
-        if (i < s.size() && s[i] == '}') { ++i; return true; }
-        return false;
-    }
-    return false;
-}
-
-static std::string jsonValueToString(const JsonValue &v)
-{
-    switch (v.type) {
-        case JsonValue::String: return v.str;
-        case JsonValue::Number: return std::to_string(static_cast<int>(v.num));
-        case JsonValue::Bool: return v.boolean ? "true" : "false";
-        default: return "";
-    }
-}
-
-// ==================== HTTP 基础 ====================
-
-static bool readRequest(int fd, std::string &method, std::string &path, std::string &body)
-{
-    char buf[4096];
-    std::string raw;
-    int contentLength = -1;
-    bool gotHeaders = false;
-
-    while (true) {
-        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) return false;
-        buf[n] = '\0';
-        raw += buf;
-
-        if (!gotHeaders) {
-            size_t sep = raw.find("\r\n\r\n");
-            if (sep == std::string::npos) {
-                if (raw.size() > 8192) return false;
-                continue;
-            }
-            std::string headers = raw.substr(0, sep);
-            body = raw.substr(sep + 4);
-
-            size_t sp1 = headers.find(' ');
-            if (sp1 == std::string::npos) return false;
-            method = headers.substr(0, sp1);
-            size_t sp2 = headers.find(' ', sp1 + 1);
-            if (sp2 == std::string::npos) return false;
-            path = headers.substr(sp1 + 1, sp2 - sp1 - 1);
-
-            size_t cl = headers.find("Content-Length:");
-            if (cl != std::string::npos) {
-                cl += 14;
-                while (cl < headers.size() && headers[cl] == ' ') cl++;
-                contentLength = std::stoi(headers.substr(cl));
-            }
-            gotHeaders = true;
-        }
-
-        if (contentLength < 0 || static_cast<int>(body.size()) >= contentLength) break;
-        if (raw.size() > 65536) return false;
-    }
-    return true;
-}
-
-static void sendResponse(int fd, int code, const std::string &body,
-                         const std::string &contentType = "application/json")
-{
-    const char *msg = (code == 200) ? "OK"
-                    : (code == 400) ? "Bad Request"
-                    : (code == 500) ? "Internal Server Error"
-                    : "Error";
-    std::ostringstream out;
-    out << "HTTP/1.1 " << code << " " << msg << "\r\n"
-        << "Content-Type: " << contentType << "; charset=utf-8\r\n"
-        << "Content-Length: " << body.size() << "\r\n"
-        << "Connection: close\r\n\r\n"
-        << body;
-    std::string s = out.str();
-    send(fd, s.data(), s.size(), MSG_NOSIGNAL);
-}
-
-static std::string jsonOk(const std::string &key, const std::string &val)
-{
-    return "{\"ok\":true,\"" + key + "\":\"" + val + "\"}";
-}
-static std::string jsonErr(const std::string &msg)
-{
-    return "{\"ok\":false,\"error\":\"" + msg + "\"}";
-}
-
-// ==================== 配置解析 ====================
+// ==================== 参数解析 ====================
 
 static bool toBool(const std::string &v, bool def = false)
 {
@@ -285,81 +59,181 @@ static int toInt(const std::string &v, int def = 0)
     return atoi(v.c_str());
 }
 
+// base64 解码到字节缓冲区；包含非法字符时返回 false
+static bool base64Decode(const std::string &in, unsigned char *out, size_t outCap, size_t &outLen)
+{
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint32_t val = 0;
+    int valb = -8;
+    outLen = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        const char *hit = strchr(tbl, static_cast<int>(c));
+        if (!hit) return false;
+        val = (val << 6) | static_cast<uint32_t>(hit - tbl);
+        valb += 6;
+        if (valb >= 0) {
+            if (outLen >= outCap) return false;
+            out[outLen++] = static_cast<unsigned char>((val >> valb) & 0xFF);
+            valb -= 8;
+        }
+    }
+    return true;
+}
+
 static bool parseVkek(const std::string &s, unsigned char out[16])
 {
     memset(out, 0, 16);
     if (s.empty()) return false;
 
-    // 32 个十六进制字符 -> 解码为 16 字节
-    bool hexLike = s.size() == 32 &&
-        std::all_of(s.begin(), s.end(), [](unsigned char c) { return isxdigit(c) != 0; });
-    if (hexLike) {
-        for (int i = 0; i < 16; ++i) {
-            unsigned int b = 0;
-            sscanf(s.c_str() + i * 2, "%2x", &b);
-            out[i] = static_cast<unsigned char>(b);
-        }
-        return true;
+    // base64 解码为字节（最多取 16 字节）
+    unsigned char buf[64] = {0};
+    size_t n = 0;
+    if (!base64Decode(s, buf, sizeof(buf), n) || n == 0) {
+        BLOG(warning) << "invalid vkek base64: " << s;
+        return false;
     }
-
-    // 否则按原始字节拷贝（最多 16 字节）
-    size_t n = std::min(s.size(), static_cast<size_t>(16));
-    memcpy(out, s.data(), n);
+    size_t copyLen = std::min(n, static_cast<size_t>(16));
+    memcpy(out, buf, copyLen);
     return true;
 }
 
-// 由统一参数表构建 TransferConfig；失败返回非空错误信息
-static std::string buildConfig(const std::map<std::string, std::string> &p, TransferConfig &cfg)
+// 任意 JSON 值统一转为字符串，供 toBool / toInt 等复用
+static std::string jsonToString(const json &v)
 {
-    auto has = [&p](const std::string &k) { return p.count(k) > 0 && !p.at(k).empty(); };
-    auto get = [&p](const std::string &k) { return p.count(k) ? p.at(k) : std::string(); };
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+    if (v.is_number_integer()) return std::to_string(v.get<int64_t>());
+    if (v.is_number_unsigned()) return std::to_string(v.get<uint64_t>());
+    if (v.is_number_float()) return std::to_string(v.get<double>());
+    return "";
+}
 
-    std::string url = get("url");
-    if (url.empty()) return "missing url";
-    StreamUrl recv = parseStreamUrl(url);
-    if (!recv.ok) return "invalid url, expect tcp://ip or udp://ip (port optional)";
-    cfg.protocol = (recv.protocol == "tcp" || recv.protocol == "TCP") ? Protocol::TCP : Protocol::UDP;
-    cfg.recvIp   = recv.ip;
-    cfg.recvPort = static_cast<uint16_t>(recv.port);
+// 合并 query 参数与 JSON body（body 覆盖 query）
+static json collectParams(const httplib::Request &req)
+{
+    json p = json::object();
+    for (const auto &kv : req.params) {
+        p[kv.first] = kv.second;
+    }
+    if (!req.body.empty()) {
+        try {
+            json body = json::parse(req.body);
+            if (body.is_object()) {
+                for (auto it = body.begin(); it != body.end(); ++it) {
+                    p[it.key()] = it.value();
+                }
+            }
+        } catch (const json::parse_error &) {
+            // 非法 body 忽略，必填项由 buildConfig 校验
+        }
+    }
+    return p;
+}
 
-    std::string dstIp = get("dst_ip").empty() ? get("dstIp") : get("dst_ip");
-    std::string dstPort = get("dst_port").empty() ? get("dstPort") : get("dst_port");
+// 统一获取 JSON 字段并转为字符串
+static std::string getParam(const json &p, const std::string &k)
+{
+    auto it = p.find(k);
+    return it == p.end() ? std::string() : jsonToString(*it);
+}
+
+static bool hasParam(const json &p, const std::string &k)
+{
+    return p.contains(k);
+}
+
+// 解析 src_protocol 与解密/转码等公共参数；失败返回非空错误信息
+static std::string parseCommonParams(const json &p, TransferConfig &cfg)
+{
+    std::string proto = getParam(p, "src_protocol");
+    if (proto.empty()) return "missing src_protocol";
+    if (proto == "tcp" || proto == "TCP") {
+        cfg.protocol = Protocol::TCP;
+    } else if (proto == "udp" || proto == "UDP") {
+        cfg.protocol = Protocol::UDP;
+    } else {
+        return "invalid src_protocol, expect tcp or udp";
+    }
+    cfg.recvIp   = "";
+    cfg.recvPort = 0; // 始终由内核自动分配
+
+    cfg.decrypt   = toBool(getParam(p, "decrypt"), false);
+    cfg.transcode = toBool(getParam(p, "transcode"), false);
+
+    std::string fmt = getParam(p, "transcode_format");
+    if (!fmt.empty()) cfg.transcodeFormat = fmt;
+
+    std::string vkekVersion = getParam(p, "vkek_version");
+    cfg.vkekVersion = vkekVersion.empty() ? "1.0" : vkekVersion;
+    std::string vkekStr = getParam(p, "vkek");
+    if (!vkekStr.empty()) parseVkek(vkekStr, cfg.vkek);
+
+    cfg.fps     = hasParam(p, "fps") ? toInt(getParam(p, "fps"), 25) : 25;
+    cfg.bitrate = hasParam(p, "bitrate") ? toInt(getParam(p, "bitrate"), 2000000) : 2000000;
+    cfg.width   = hasParam(p, "width") ? toInt(getParam(p, "width"), 1920) : 1920;
+    cfg.height  = hasParam(p, "height") ? toInt(getParam(p, "height"), 1080) : 1080;
+
+    std::string lib = getParam(p, "decoder_lib_path");
+    if (!lib.empty()) cfg.decoderLibPath = lib;
+
+    return "";
+}
+
+// 由统一参数对象构建转发 TransferConfig；失败返回非空错误信息
+static std::string buildConfig(const json &p, TransferConfig &cfg)
+{
+    std::string err = parseCommonParams(p, cfg);
+    if (!err.empty()) return err;
+
+    std::string dstIp = getParam(p, "dst_ip").empty() ? getParam(p, "dstIp") : getParam(p, "dst_ip");
+    std::string dstPort = getParam(p, "dst_port").empty() ? getParam(p, "dstPort") : getParam(p, "dst_port");
     if (dstIp.empty()) return "missing dst_ip";
     if (dstPort.empty()) return "missing dst_port";
     cfg.dstIp   = dstIp;
     cfg.dstPort = toInt(dstPort);
 
-    std::string outProto = get("out_protocol").empty() ? get("outProtocol") : get("out_protocol");
+    std::string outProto = getParam(p, "out_protocol").empty() ? getParam(p, "outProtocol") : getParam(p, "out_protocol");
     if (!outProto.empty()) {
         cfg.outProtocol = (outProto == "tcp" || outProto == "TCP") ? Protocol::TCP : Protocol::UDP;
     }
 
-    cfg.decrypt   = toBool(get("decrypt"), false);
-    cfg.transcode = toBool(get("transcode"), false);
-
-    std::string fmt = get("transcode_format");
-    if (!fmt.empty()) {
-        cfg.transcodeFormat = fmt;
-    }
-
-    cfg.vkekVersion = get("vkek_version").empty() ? "1.0" : get("vkek_version");
-    std::string vkekStr = get("vkek");
-    if (!vkekStr.empty()) {
-        parseVkek(vkekStr, cfg.vkek);
-    }
-
-    cfg.fps     = has("fps") ? toInt(get("fps"), 25) : 25;
-    cfg.bitrate = has("bitrate") ? toInt(get("bitrate"), 2000000) : 2000000;
-    cfg.width   = has("width") ? toInt(get("width"), 1920) : 1920;
-    cfg.height  = has("height") ? toInt(get("height"), 1080) : 1080;
-
-    std::string lib = get("decoder_lib_path");
-    if (!lib.empty()) cfg.decoderLibPath = lib;
-
-    std::string ssrc = get("ssrc");
+    std::string ssrc = getParam(p, "ssrc");
     if (!ssrc.empty()) cfg.ssrc = static_cast<uint32_t>(strtoul(ssrc.c_str(), nullptr, 0));
 
     return "";
+}
+
+// 构建“保存到文件”配置（不对外推送）
+static std::string buildSaveConfig(const json &p, TransferConfig &cfg)
+{
+    std::string err = parseCommonParams(p, cfg);
+    if (!err.empty()) return err;
+
+    cfg.saveToFile   = true;
+    cfg.recvFilePath = getParam(p, "recv_file").empty() ? getParam(p, "recvFile") : getParam(p, "recv_file");
+    cfg.outFilePath  = getParam(p, "out_file").empty() ? getParam(p, "outFile") : getParam(p, "out_file");
+    if (cfg.recvFilePath.empty()) return "missing recv_file";
+    if (cfg.outFilePath.empty()) return "missing out_file";
+
+    return "";
+}
+
+static void reply(httplib::Response &res, int status, const json &body)
+{
+    res.status = status;
+    res.set_content(body.dump(), "application/json");
+}
+
+// 输入编码类型码 -> 字符串
+static const char *inputFormatString(int codecid)
+{
+    switch (codecid) {
+        case PSI_STREAM_VIDEO_SVAC: return "svac";
+        case PSI_STREAM_H264:       return "h264";
+        case PSI_STREAM_H265:       return "h265";
+        default:                    return "unknown";
+    }
 }
 
 // ==================== 主流程 ====================
@@ -369,118 +243,162 @@ int main(int argc, char *argv[])
     int httpPort = 8080;
     if (argc >= 2) httpPort = atoi(argv[1]);
 
-    signal(SIGINT, sigint_handler);
+    std::map<uint32_t, std::unique_ptr<TransferServer>> transfers;
+    std::mutex transfersMutex;
+    std::atomic<uint32_t> nextId{1};
 
-    std::unique_ptr<TransferServer> transfer;
-    std::mutex transferMutex;
+    httplib::Server svr;
 
-    int listenFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenFd < 0) {
-        BLOG(error) << "socket failed";
-        return 1;
-    }
-    int opt = 1;
-    setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(static_cast<uint16_t>(httpPort));
-
-    if (bind(listenFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        BLOG(error) << "bind failed on port " << httpPort;
-        close(listenFd);
-        return 1;
-    }
-    if (listen(listenFd, 8) < 0) {
-        BLOG(error) << "listen failed";
-        close(listenFd);
-        return 1;
-    }
-    BLOG(info) << "TransferServer HTTP listening on port " << httpPort;
-
-    while (!g_quit) {
-        struct timeval tv = {1, 0};
-        fd_set rd;
-        FD_ZERO(&rd);
-        FD_SET(listenFd, &rd);
-        int r = select(listenFd + 1, &rd, nullptr, nullptr, &tv);
-        if (r <= 0) continue;
-
-        int client = accept(listenFd, nullptr, nullptr);
-        if (client < 0) continue;
-
-        std::string method, path, body;
-        if (!readRequest(client, method, path, body)) {
-            close(client);
-            continue;
+    auto onStart = [&](const httplib::Request &req, httplib::Response &res) {
+        TransferConfig cfg;
+        std::string err = buildConfig(collectParams(req), cfg);
+        if (!err.empty()) {
+            reply(res, 400, {{"ok", false}, {"error", err}});
+            return;
         }
 
-        size_t q = path.find('?');
-        std::string pathOnly = (q != std::string::npos) ? path.substr(0, q) : path;
-        std::string query = (q != std::string::npos && q + 1 < path.size()) ? path.substr(q + 1) : "";
+        uint32_t id = nextId.fetch_add(1);
+        auto transfer = std::make_unique<TransferServer>();
+        if (!transfer->start(cfg)) {
+            reply(res, 500, {{"ok", false}, {"error", "transfer start failed"}});
+            return;
+        }
 
-        if (pathOnly == "/transfer/start" && (method == "POST" || method == "GET")) {
-            // 参数来源：query 优先合并，JSON body 覆盖
-            std::map<std::string, std::string> params = parseQuery(query);
-            if (!body.empty()) {
-                std::map<std::string, JsonValue> json;
-                if (parseJsonObject(body, json)) {
-                    for (const auto &kv : json) {
-                        params[kv.first] = jsonValueToString(kv.second);
-                    }
-                }
-            }
+        uint16_t recvPort = transfer->getRecvPort();
+        {
+            std::lock_guard<std::mutex> lk(transfersMutex);
+            transfers[id] = std::move(transfer);
+        }
 
-            TransferConfig cfg;
-            std::string err = buildConfig(params, cfg);
-            if (!err.empty()) {
-                sendResponse(client, 400, jsonErr(err));
-                close(client);
-                continue;
-            }
+        reply(res, 200, {{"ok", true}, {"status", "started"}, {"id", id}, {"recv_port", recvPort}});
+    };
 
-            std::lock_guard<std::mutex> lk(transferMutex);
-            if (transfer && transfer->isRunning()) {
-                sendResponse(client, 400, jsonErr("transfer already running"));
-                close(client);
-                continue;
-            }
+    auto onStop = [&](const httplib::Request &req, httplib::Response &res) {
+        bool hasId = req.has_param("id");
+        uint32_t id = hasId
+            ? static_cast<uint32_t>(strtoul(req.get_param_value("id").c_str(), nullptr, 0))
+            : 0;
 
-            transfer = std::make_unique<TransferServer>();
-            if (!transfer->start(cfg)) {
-                sendResponse(client, 500, jsonErr("transfer start failed"));
-                transfer.reset();
-            } else {
-                uint16_t recvPort = transfer->getRecvPort();
-                std::string body = "{\"ok\":true,\"status\":\"started\",\"recv_port\":"
-                    + std::to_string(recvPort) + "}";
-                sendResponse(client, 200, body);
+        std::lock_guard<std::mutex> lk(transfersMutex);
+        if (hasId) {
+            auto it = transfers.find(id);
+            if (it == transfers.end()) {
+                reply(res, 404, {{"ok", false}, {"error", "transfer not found"}});
+                return;
             }
-        } else if (pathOnly == "/transfer/stop" && (method == "POST" || method == "GET")) {
-            std::lock_guard<std::mutex> lk(transferMutex);
-            if (transfer) {
-                transfer->stop();
-                transfer.reset();
-                sendResponse(client, 200, jsonOk("status", "stopped"));
-            } else {
-                sendResponse(client, 200, jsonOk("status", "not_running"));
-            }
-        } else if (pathOnly == "/transfer/status" && method == "GET") {
-            std::lock_guard<std::mutex> lk(transferMutex);
-            bool running = transfer && transfer->isRunning();
-            sendResponse(client, 200, running ? jsonOk("status", "running") : jsonOk("status", "stopped"));
+            it->second->stop();
+            transfers.erase(it);
+            reply(res, 200, {{"ok", true}, {"status", "stopped"}});
         } else {
-            sendResponse(client, 404, jsonErr("not found"));
+            for (auto &kv : transfers) {
+                if (kv.second) kv.second->stop();
+            }
+            transfers.clear();
+            reply(res, 200, {{"ok", true}, {"status", "stopped"}});
         }
-        close(client);
-    }
+    };
 
-    {
-        std::lock_guard<std::mutex> lk(transferMutex);
-        if (transfer) transfer->stop();
+    auto onStatus = [&](const httplib::Request &req, httplib::Response &res) {
+        bool hasId = req.has_param("id");
+        uint32_t id = hasId
+            ? static_cast<uint32_t>(strtoul(req.get_param_value("id").c_str(), nullptr, 0))
+            : 0;
+
+        std::lock_guard<std::mutex> lk(transfersMutex);
+        if (hasId) {
+            auto it = transfers.find(id);
+            if (it == transfers.end()) {
+                reply(res, 404, {{"ok", false}, {"error", "transfer not found"}});
+                return;
+            }
+            bool running = it->second && it->second->isRunning();
+            reply(res, 200, {{"ok", true}, {"status", running ? "running" : "stopped"}});
+        } else {
+            json arr = json::array();
+            for (const auto &kv : transfers) {
+                arr.push_back({
+                    {"id", kv.first},
+                    {"status", (kv.second && kv.second->isRunning()) ? "running" : "stopped"},
+                    {"recv_port", kv.second ? kv.second->getRecvPort() : 0},
+                });
+            }
+            reply(res, 200, {{"ok", true}, {"count", transfers.size()}, {"transfers", arr}});
+        }
+    };
+
+    auto onTranscode = [&](const httplib::Request &req, httplib::Response &res) {
+        (void)req;
+        std::lock_guard<std::mutex> lk(transfersMutex);
+        json arr = json::array();
+        for (const auto &kv : transfers) {
+            const TransferServer *t = kv.second.get();
+            if (!t || !t->isRunning()) continue;
+            const TransferConfig &c = t->config();
+            if (!c.transcode) continue; // 只返回转码路
+            arr.push_back({
+                {"id", kv.first},
+                {"transcode_format", c.transcodeFormat},
+                {"input_format", inputFormatString(t->inputCodecid())},
+                {"decrypt", c.decrypt},
+                {"protocol", c.protocol == Protocol::TCP ? "tcp" : "udp"},
+                {"recv_ip", c.recvIp},
+                {"recv_port", t->getRecvPort()},
+                {"out_protocol", c.outProtocol == Protocol::TCP ? "tcp" : "udp"},
+                {"dst_ip", c.dstIp},
+                {"dst_port", c.dstPort},
+                {"fps", c.fps},
+                {"bitrate", c.bitrate},
+                {"width", c.width},
+                {"height", c.height},
+            });
+        }
+        reply(res, 200, {{"ok", true}, {"count", arr.size()}, {"transfers", arr}});
+    };
+
+    auto onSave = [&](const httplib::Request &req, httplib::Response &res) {
+        TransferConfig cfg;
+        std::string err = buildSaveConfig(collectParams(req), cfg);
+        if (!err.empty()) {
+            reply(res, 400, {{"ok", false}, {"error", err}});
+            return;
+        }
+
+        uint32_t id = nextId.fetch_add(1);
+        auto transfer = std::make_unique<TransferServer>();
+        if (!transfer->start(cfg)) {
+            reply(res, 500, {{"ok", false}, {"error", "transfer start failed"}});
+            return;
+        }
+
+        uint16_t recvPort = transfer->getRecvPort();
+        {
+            std::lock_guard<std::mutex> lk(transfersMutex);
+            transfers[id] = std::move(transfer);
+        }
+
+        reply(res, 200, {
+            {"ok", true},
+            {"status", "started"},
+            {"id", id},
+            {"recv_port", recvPort},
+            {"recv_file", cfg.recvFilePath},
+            {"out_file", cfg.outFilePath},
+        });
+    };
+
+    svr.Get("/transfer/start", onStart);
+    svr.Post("/transfer/start", onStart);
+    svr.Get("/transfer/save", onSave);
+    svr.Post("/transfer/save", onSave);
+    svr.Get("/transfer/stop", onStop);
+    svr.Post("/transfer/stop", onStop);
+    svr.Get("/transfer/status", onStatus);
+    svr.Get("/transfer/transcode", onTranscode);
+
+    BLOG(info) << "TransferServer HTTP listening on port " << httpPort;
+    if (!svr.listen("0.0.0.0", httpPort)) {
+        BLOG(error) << "listen failed on port " << httpPort;
+        return 1;
     }
-    close(listenFd);
-    BLOG(info) << "TransferServer HTTP stopped";
     return 0;
 }

@@ -1,0 +1,26 @@
+# TransferServer 运行编排
+#
+# 用法：
+#   SDK_DIR=/host/path/to/sdk HTTP_PORT=8080 docker compose up -d --build
+#
+# 关键说明：
+#   - network_mode: host 必须：转发数据端口由 /transfer/start 动态创建（TCP/UDP），
+#     容器内无法预映射这些动态端口，故直接使用宿主机网络。
+#   - SDK 挂载到 /opt/transferserver/sdk（对应程序默认 ./sdk/libZXSvacDec.so），
+#     目录内需包含 libZXSvacDec.so。
+#   - 构建依赖宿主机已存在 build/TransferServer（由编译镜像产出）。
+
+services:
+  transferserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runtime
+    image: transferserver:latest
+    container_name: transferserver
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${SDK_DIR:-./sdk}:/opt/transferserver/sdk:ro
+    command: ["${HTTP_PORT:-8080}"]
+
+

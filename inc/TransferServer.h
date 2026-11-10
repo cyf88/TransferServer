@@ -13,6 +13,7 @@
 #include "mpeg-ps.h"
 
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +52,11 @@ struct TransferConfig {
 
     // ===== SVAC 解码库路径（转码时使用）=====
     std::string decoderLibPath = "./sdk/libZXSvacDec.so";
+
+    // ===== 保存到文件（此时不对外推送）=====
+    bool saveToFile = false;                 // 是否保存到文件（开启后不创建发送器）
+    std::string recvFilePath;                // 接收流(PS)保存路径
+    std::string outFilePath;                 // 解密/转码后裸流(ES)保存路径
 };
 
 /**
@@ -74,6 +80,12 @@ public:
 
     /** 获取实际收流端口（由服务分配；仅在 start() 后有效） */
     uint16_t getRecvPort() const { return _networkReceiver ? _networkReceiver->getPort() : 0; }
+
+    /** 获取当前转发配置（只读，start() 后有效） */
+    const TransferConfig &config() const { return _cfg; }
+
+    /** 当前接收到的输入视频编码类型码（PSI_STREAM_*，尚未收到时为 -1） */
+    int inputCodecid() const { return _inputCodecid.load(); }
 
 private:
     /** 转码路径发送线程：从 FramePool 取 YUV 帧，编码后通过 PSSender 发送 */
@@ -104,6 +116,17 @@ private:
     std::mutex _poolMutex;
 
     uint64_t _pts = 0; // 90kHz 时间戳
+    std::atomic<int> _inputCodecid{-1}; // 接收到的输入视频编码类型（PSI_STREAM_*）
+
+    // ===== 文件保存（saveToFile 模式）=====
+    std::FILE *_recvFile = nullptr; // 接收流(PS)文件句柄
+    std::FILE *_outFile = nullptr;  // 解密/转码后裸流(ES)文件句柄
+    std::mutex _fileMutex;
+
+    void openSaveFiles();
+    void writeRecvStream(const uint8_t *data, size_t len);
+    void writeOutStream(const uint8_t *data, size_t len);
+    void closeSaveFiles();
 };
 
 #endif // TRANSFER_SERVER_H

@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/inc)
 set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # 统一引用 media-server 工程内的第三方库
 set(LIBMPEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/media-server/libmpeg)
 set(LIBRTP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/media-server/librtp)
@@ -68,6 +69,7 @@ add_executable(${PROJECT_NAME} ${TRANSFER_SOURCES} ${LIBMPEG_SOURCES} ${LIBRTP_S
 target_include_directories(${PROJECT_NAME}
     PRIVATE
     ${INCLUDE_DIR}
+    ${THIRD_PARTY_DIR}
     ${LIBMPEG_DIR}/include
     ${LIBMPEG_DIR}/source
     ${LIBRTP_DIR}/include

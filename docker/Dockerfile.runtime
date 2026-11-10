@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+
+# ============================================================================
+# 运行镜像：仅包含已编译的 TransferServer 二进制 + 最小运行时依赖。
+# 二进制由编译环境镜像（docker/Dockerfile）+ docker/build.sh 产出，
+# 位于宿主机 build/TransferServer，构建本镜像前需先完成编译。
+#
+# SVAC 解码 SDK（libZXSvacDec.so）由外部提供，不打进镜像，
+# 运行时 -v 挂载到 /opt/transferserver/sdk（对应程序默认 ./sdk/libZXSvacDec.so）。
+# ============================================================================
+FROM centos:7
+
+# CentOS 7 官方 vault 源已失效，改用阿里云镜像源安装 zlib 运行时库
+RUN set -eux; \
+    sed -i \
+        -e 's|^mirrorlist=|#mirrorlist=|g' \
+        -e 's|^metalink=|#metalink=|g' \
+        -e 's|^# *baseurl=http://mirror.centos.org|baseurl=http://mirrors.aliyun.com|g' \
+        -e 's|^baseurl=http://mirror.centos.org|baseurl=http://mirrors.aliyun.com|g' \
+        /etc/yum.repos.d/CentOS-Base.repo; \
+    yum -y install zlib; \
+    yum clean all
+
+WORKDIR /opt/transferserver
+
+# 编译产物（需先通过编译镜像产出到宿主机 build/ 目录）
+COPY build/TransferServer /opt/transferserver/TransferServer
+RUN chmod +x /opt/transferserver/TransferServer
+
+# SVAC 解码 SDK 运行时挂载目录（对应程序默认 ./sdk/libZXSvacDec.so）
+# 用法：-v /host/sdk:/opt/transferserver/sdk
+
+# HTTP 控制端口（默认 8080）
+EXPOSE 8080
+
+ENTRYPOINT ["/opt/transferserver/TransferServer"]
+CMD ["8080"]

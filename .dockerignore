@@ -1,0 +1,24 @@
+# 版本控制
+.git
+.idea
+.trae
+.vscode
+.Trash
+
+# SVAC 解码 SDK 由外部提供，运行时挂载，不打包进镜像
+sdk
+
+# 编译产物
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+cmake-build-*
+
+# media-server 中本项目未使用的目录（仅用到 libmpeg / librtp）
+media-server/test
+media-server/**/*.xcodeproj
+media-server/**/*.vcxproj*
+media-server/**/*.sln
