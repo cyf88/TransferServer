@@ -47,8 +47,7 @@ struct TransferConfig {
     // ===== 转码参数 =====
     int fps = 25;
     int bitrate = 2000000;
-    int width = 1920;
-    int height = 1080;
+    int idleTimeoutSec = 0;   // 收流空闲超时（秒），0 表示不超时
 
     // ===== SVAC 解码库路径（转码时使用）=====
     std::string decoderLibPath = "./sdk/libZXSvacDec.so";
@@ -87,6 +86,10 @@ public:
     /** 当前接收到的输入视频编码类型码（PSI_STREAM_*，尚未收到时为 -1） */
     int inputCodecid() const { return _inputCodecid.load(); }
 
+    /** 实际输入流分辨率（转码输出分辨率与输入一致；尚未解码出帧时为 0） */
+    int width() const { return _width.load(); }
+    int height() const { return _height.load(); }
+
 private:
     /** 转码路径发送线程：从 FramePool 取 YUV 帧，编码后通过 PSSender 发送 */
     void sendLoop();
@@ -96,6 +99,9 @@ private:
 
     /** 解码器输出 YUV 帧 -> FramePool（转码路径共用） */
     void onDecodedYuv(const Frame &frame);
+
+    /** 空闲超时看门狗线程：收流空闲超过 idleTimeoutSec 则自动停止 */
+    void watchdogLoop();
 
 private:
     TransferConfig _cfg;
@@ -117,6 +123,12 @@ private:
 
     uint64_t _pts = 0; // 90kHz 时间戳
     std::atomic<int> _inputCodecid{-1}; // 接收到的输入视频编码类型（PSI_STREAM_*）
+    std::atomic<int> _width{0};   // 实际输入流分辨率（宽）
+    std::atomic<int> _height{0};  // 实际输入流分辨率（高）
+
+    // ===== 空闲超时 =====
+    std::atomic<int64_t> _lastRecvMs{0}; // 最近一次收流时间（毫秒）
+    std::thread _watchdogThread;          // 空闲超时看门狗线程
 
     // ===== 文件保存（saveToFile 模式）=====
     std::FILE *_recvFile = nullptr; // 接收流(PS)文件句柄

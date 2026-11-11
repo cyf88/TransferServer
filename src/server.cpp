@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,38 @@
 #include <utility>
 
 using nlohmann::json;
+
+// ==================== 配置读取 ====================
+
+// 收流空闲超时（秒），0 表示不超时；由 config.ini 读取
+static int g_idleTimeoutSec = 0;
+
+// 从 config.ini 读取整型配置项（key=value，支持 # 注释），读不到返回默认值
+static int readConfigInt(const std::string &path, const std::string &key, int defaultValue)
+{
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) return defaultValue;
+
+    auto trim = [](std::string s) {
+        size_t b = s.find_first_not_of(" \t\r\n");
+        size_t e = s.find_last_not_of(" \t\r\n");
+        if (b == std::string::npos) return std::string();
+        return s.substr(b, e - b + 1);
+    };
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        size_t pos = line.find('#');
+        if (pos != std::string::npos) line = line.substr(0, pos);
+        pos = line.find('=');
+        if (pos == std::string::npos) continue;
+        if (trim(line.substr(0, pos)) == key) {
+            std::string v = trim(line.substr(pos + 1));
+            try { return std::stoi(v); } catch (...) { return defaultValue; }
+        }
+    }
+    return defaultValue;
+}
 
 // ==================== 参数解析 ====================
 
@@ -171,11 +204,7 @@ static std::string parseCommonParams(const json &p, TransferConfig &cfg)
 
     cfg.fps     = hasParam(p, "fps") ? toInt(getParam(p, "fps"), 25) : 25;
     cfg.bitrate = hasParam(p, "bitrate") ? toInt(getParam(p, "bitrate"), 2000000) : 2000000;
-    cfg.width   = hasParam(p, "width") ? toInt(getParam(p, "width"), 1920) : 1920;
-    cfg.height  = hasParam(p, "height") ? toInt(getParam(p, "height"), 1080) : 1080;
-
-    std::string lib = getParam(p, "decoder_lib_path");
-    if (!lib.empty()) cfg.decoderLibPath = lib;
+    cfg.idleTimeoutSec = g_idleTimeoutSec;
 
     return "";
 }
@@ -243,6 +272,9 @@ int main(int argc, char *argv[])
     int httpPort = 8080;
     if (argc >= 2) httpPort = atoi(argv[1]);
 
+    g_idleTimeoutSec = readConfigInt("config.ini", "idle_timeout", 0);
+    BLOG(info) << "config.ini idle_timeout=" << g_idleTimeoutSec;
+
     std::map<uint32_t, std::unique_ptr<TransferServer>> transfers;
     std::mutex transfersMutex;
     std::atomic<uint32_t> nextId{1};
@@ -250,12 +282,18 @@ int main(int argc, char *argv[])
     httplib::Server svr;
 
     auto onStart = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
         TransferConfig cfg;
         std::string err = buildConfig(collectParams(req), cfg);
         if (!err.empty()) {
+            BLOG(warning) << "[HTTP] start 参数错误: " << err;
             reply(res, 400, {{"ok", false}, {"error", err}});
             return;
         }
+        BLOG(info) << "[HTTP] start: src_protocol=" << (cfg.protocol == Protocol::TCP ? "tcp" : "udp")
+                   << " dst=" << cfg.dstIp << ":" << cfg.dstPort
+                   << " decrypt=" << (cfg.decrypt ? "on" : "off")
+                   << " transcode=" << (cfg.transcode ? cfg.transcodeFormat : "off");
 
         uint32_t id = nextId.fetch_add(1);
         auto transfer = std::make_unique<TransferServer>();
@@ -274,6 +312,7 @@ int main(int argc, char *argv[])
     };
 
     auto onStop = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
         bool hasId = req.has_param("id");
         uint32_t id = hasId
             ? static_cast<uint32_t>(strtoul(req.get_param_value("id").c_str(), nullptr, 0))
@@ -299,6 +338,7 @@ int main(int argc, char *argv[])
     };
 
     auto onStatus = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
         bool hasId = req.has_param("id");
         uint32_t id = hasId
             ? static_cast<uint32_t>(strtoul(req.get_param_value("id").c_str(), nullptr, 0))
@@ -327,7 +367,7 @@ int main(int argc, char *argv[])
     };
 
     auto onTranscode = [&](const httplib::Request &req, httplib::Response &res) {
-        (void)req;
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
         std::lock_guard<std::mutex> lk(transfersMutex);
         json arr = json::array();
         for (const auto &kv : transfers) {
@@ -348,20 +388,27 @@ int main(int argc, char *argv[])
                 {"dst_port", c.dstPort},
                 {"fps", c.fps},
                 {"bitrate", c.bitrate},
-                {"width", c.width},
-                {"height", c.height},
+                {"width", t->width()},
+                {"height", t->height()},
             });
         }
         reply(res, 200, {{"ok", true}, {"count", arr.size()}, {"transfers", arr}});
     };
 
     auto onSave = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
         TransferConfig cfg;
         std::string err = buildSaveConfig(collectParams(req), cfg);
         if (!err.empty()) {
+            BLOG(warning) << "[HTTP] save 参数错误: " << err;
             reply(res, 400, {{"ok", false}, {"error", err}});
             return;
         }
+        BLOG(info) << "[HTTP] save: src_protocol=" << (cfg.protocol == Protocol::TCP ? "tcp" : "udp")
+                   << " recv_file=" << cfg.recvFilePath
+                   << " out_file=" << cfg.outFilePath
+                   << " decrypt=" << (cfg.decrypt ? "on" : "off")
+                   << " transcode=" << (cfg.transcode ? cfg.transcodeFormat : "off");
 
         uint32_t id = nextId.fetch_add(1);
         auto transfer = std::make_unique<TransferServer>();

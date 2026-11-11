@@ -41,6 +41,8 @@ TransferServer::TransferServer()
 TransferServer::~TransferServer()
 {
     stop();
+    if (_watchdogThread.joinable())
+        _watchdogThread.join();
 }
 
 bool TransferServer::start(const TransferConfig &cfg)
@@ -81,6 +83,8 @@ bool TransferServer::start(const TransferConfig &cfg)
     // ===== 第四步：搭建回调链 =====
     // RTP 输入 -> RtpReceiver
     _networkReceiver->setCallback([this](const uint8_t *data, size_t len) {
+        _lastRecvMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count());
         if (_cfg.protocol == Protocol::TCP) {
             _rtpReceiver.inputTcp(data, len);
         } else {
@@ -117,8 +121,13 @@ bool TransferServer::start(const TransferConfig &cfg)
 
     // ===== 第五步：启动发送线程（转码路径），否则直接标记运行 =====
     _running = true;
+    _lastRecvMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count());
     if (_cfg.transcode) {
         _sendThread = std::thread(&TransferServer::sendLoop, this);
+    }
+    if (_cfg.idleTimeoutSec > 0) {
+        _watchdogThread = std::thread(&TransferServer::watchdogLoop, this);
     }
 
     if (_cfg.saveToFile) {
@@ -146,6 +155,24 @@ void TransferServer::stop()
     closeSaveFiles();
     if (wasRunning)
         BLOG(info) << "[TransferServer] stopped";
+}
+
+void TransferServer::watchdogLoop()
+{
+    while (_running) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!_running)
+            break;
+        if (_cfg.idleTimeoutSec <= 0)
+            break;
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - _lastRecvMs.load() >= static_cast<int64_t>(_cfg.idleTimeoutSec) * 1000) {
+            BLOG(info) << "[TransferServer] 收流空闲超过 " << _cfg.idleTimeoutSec << " 秒，自动停止";
+            stop();
+            break;
+        }
+    }
 }
 
 void TransferServer::openSaveFiles()
@@ -252,13 +279,13 @@ void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool k
 void TransferServer::onDecodedYuv(const Frame &frame)
 {
     YUVEncoder::CodecType codecType = encoderCodecType(_cfg);
+    _width.store(frame.width);
+    _height.store(frame.height);
 
     std::lock_guard<std::mutex> lk(_poolMutex);
     if (!_framePool) {
-        int w = frame.width > 0 ? frame.width : _cfg.width;
-        int h = frame.height > 0 ? frame.height : _cfg.height;
-        _framePool  = std::make_unique<FramePool>(kFramePoolCapacity, w, h);
-        _yuvEncoder = std::make_unique<YUVEncoder>(codecType, w, h, _cfg.fps, _cfg.bitrate);
+        _framePool  = std::make_unique<FramePool>(kFramePoolCapacity, frame.width, frame.height);
+        _yuvEncoder = std::make_unique<YUVEncoder>(codecType, frame.width, frame.height, _cfg.fps, _cfg.bitrate);
     }
     FramePool *pool = _framePool.get();
     if (!pool)

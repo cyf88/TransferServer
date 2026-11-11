@@ -45,9 +45,6 @@ GET  /transfer/start
 | `vkek_version` | string | 否 | `1.0` | 密钥版本 |
 | `fps` | int | 否 | `25` | 转码帧率 |
 | `bitrate` | int | 否 | `2000000` | 转码码率（bps） |
-| `width` | int | 否 | `1920` | 转码目标宽度 |
-| `height` | int | 否 | `1080` | 转码目标高度 |
-| `decoder_lib_path` | string | 否 | `./sdk/libZXSvacDec.so` | SVAC 解码库路径 |
 | `ssrc` | uint | 否 | `0x12345678` | 输出 RTP SSRC |
 
 ### 请求示例
@@ -207,7 +204,8 @@ GET /transfer/transcode
 | `recv_ip` / `recv_port` | 输入监听地址与实际收流端口 |
 | `out_protocol` | 输出传输协议（`tcp` / `udp`） |
 | `dst_ip` / `dst_port` | 输出目标地址与端口 |
-| `fps` / `bitrate` / `width` / `height` | 转码参数 |
+| `fps` / `bitrate` | 转码参数 |
+| `width` / `height` | 实际输入流分辨率（转码输出与输入一致） |
 
 ---
 
@@ -232,8 +230,7 @@ GET  /transfer/save
 | `transcode_format` | string | 否 | `h264` | 转码输出格式：`h264` / `h265` |
 | `vkek` | string | 否 | - | 解密密钥（同 `/transfer/start`） |
 | `vkek_version` | string | 否 | `1.0` | 密钥版本 |
-| `fps` / `bitrate` / `width` / `height` | int | 否 | 同 `/transfer/start` | 转码参数 |
-| `decoder_lib_path` | string | 否 | `./sdk/libZXSvacDec.so` | SVAC 解码库路径 |
+| `fps` / `bitrate` | int | 否 | 同 `/transfer/start` | 转码参数 |
 
 ### 请求示例
 

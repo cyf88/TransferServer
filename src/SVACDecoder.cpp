@@ -41,7 +41,9 @@ static int ModifyVerValue(int _iVersion, int _iWidth, int _iHeight);
 static int ModifyThreadValue(int _iThreadNum, SVAC_PREFETCH_PARAM _stuParam);
 
 SVACDecoder::SVACDecoder(int threadNum) {
-	this->_vdCtx.thread_num = threadNum;
+	memset(&_vdCtx, 0, sizeof(_vdCtx));
+	_vdCtx.video_decode_handle = (HANDLE)-1;
+	_vdCtx.thread_num = threadNum;
 }
 
 SVACDecoder::~SVACDecoder() {
@@ -69,16 +71,18 @@ bool SVACDecoder::inputFrame(const Frame &frame) {
 
     if (_vdCtx.decode_open) {
         if (this->_cb) {
-            size_t outSize;
+            size_t outSize = 0;
             Frame outFrame;
             decodeFrame(
                 &_vdCtx, reinterpret_cast<const char *>(frame.data.data()), frame.size, frame.keyFrame, reinterpret_cast<char *>(_vdCtx.m_yuv_buf), outSize,
                 outFrame.width, outFrame.height);
-            // 将解码后的数据复制到 outFrame.data
-            outFrame.data.resize(outSize);
-            memcpy(outFrame.data.data(), _vdCtx.m_yuv_buf, outSize);
-            outFrame.size = outSize;
-            _cb(outFrame);
+            if (outSize > 0) {
+                // 将解码后的数据复制到 outFrame.data
+                outFrame.data.resize(outSize);
+                memcpy(outFrame.data.data(), _vdCtx.m_yuv_buf, outSize);
+                outFrame.size = outSize;
+                _cb(outFrame);
+            }
         }
     }
 
@@ -107,7 +111,7 @@ bool SVACDecoder::loadLibrary(std::string libPath) {
     AUTH_FUN_GET(ZXSVACDec_Init);
    // AUTH_FUN_GET(ZXSVACDec_UnInit);
     AUTH_FUN_GET(ZXSVACDec_Open);
-    //AUTH_FUN_GET(ZXSVACDec_GetHandle);
+    //AUTH_FUN_GET(ZXSVACDec_GetHandle); // Linux SDK 无此接口
     AUTH_FUN_GET(ZXSVACDec_Close);
     AUTH_FUN_GET(ZXSVACDec_PrefetchParam);
     AUTH_FUN_GET(ZXSVACDec_Decode);
@@ -216,6 +220,8 @@ void SVACDecoder::decodeFrame(
     int &width,
     int &height) {
 
+    outputSize = 0;
+
     if (keyFrame) {
         if (!openDecodeHandle(input, inputSize, vdCtx)) {
             BLOG(error) << "openDecodeHandle failed";
@@ -296,11 +302,21 @@ void SVACDecoder::decodeFrame(
         return;
 
     } else {
-        width      = dec_out.nWidth;
-        height     = dec_out.nHeight;
-		int pixelCount = dec_out.nWidth * dec_out.nHeight;
-        outputSize = pixelCount * 3 / 2;
-        BLOG(error) << "ZXSVACDec_Decode failed Error code: " << ret;
+        // ret < 0（如 -65532 POC 不连续 / -65504 图像解码错）：
+        // 对齐 triplayer——只要解码器给出了有效宽高，仍输出该帧，避免丢帧导致卡顿。
+        if (dec_out.nWidth > 0 && dec_out.nHeight > 0) {
+            BLOG(info) << "ZXSVACDec_Decode failed Error code: " << ret << " width: " << dec_out.nWidth << " height: " << dec_out.nHeight;
+            width  = dec_out.nWidth;
+            height = dec_out.nHeight;
+            int pixelCount = dec_out.nWidth * dec_out.nHeight;
+            memcpy(output, dec_out.pY, pixelCount);
+            memcpy(output + pixelCount, dec_out.pU, pixelCount / 4);
+            memcpy(output + pixelCount + pixelCount / 4, dec_out.pV, pixelCount / 4);
+            outputSize = pixelCount * 3 / 2;
+        } else {
+            outputSize = 0;
+            BLOG(error) << "ZXSVACDec_Decode failed Error code: " << ret;
+        }
     }
     return;
 }
