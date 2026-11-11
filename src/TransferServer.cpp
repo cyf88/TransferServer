@@ -233,7 +233,17 @@ void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool k
     if (!data || len == 0)
         return;
 
-    if (!_cfg.transcode) {
+    // 判断是否需要转码：未开启转码，或输入编码与目标编码一致时，直接透传
+    bool needTranscode = _cfg.transcode;
+    if (needTranscode) {
+        EPSI_STREAM_TYPE targetType = transcodeStreamType(_cfg);
+        if (static_cast<EPSI_STREAM_TYPE>(codecid) == targetType) {
+            needTranscode = false;
+            BLOG(info) << "[TransferServer] input codec matches target, skip transcode";
+        }
+    }
+
+    if (!needTranscode) {
         // 透传：保存裸流(ES) + (可选) 按原始编码重新封装推送
         writeOutStream(data, len);
         if (!_psSender)
