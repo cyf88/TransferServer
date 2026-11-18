@@ -286,9 +286,8 @@ void read_auth_rbsp(svac_stream_t *h, bs_t *b) {
     svac_auth_t *auth = h->auth;
 
     auth->frame_num = bs_read_u8(b);
-    if (h->sps->spatial_svc_flag) {
-        auth->spatial_el_flag = bs_read_u8(b);
-    }
+    // 与 SDK2 参考实现一致：AUTH 单元不读 spatial_el_flag（默认 0）
+    auth->spatial_el_flag = 0;
     auth->auth_data_lenth_minus_1 = bs_read_u8(b);
 
     for (int i = 0; i <= auth->auth_data_lenth_minus_1; i++) {

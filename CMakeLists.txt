@@ -23,6 +23,7 @@ set(TRANSFER_SOURCES
     ${SOURCE_DIR}/PSSender.cpp
     ${SOURCE_DIR}/RtpReceiver.cpp
     ${SOURCE_DIR}/SMCryptor.cpp
+    ${SOURCE_DIR}/SignatureVerifier.cpp
     ${SOURCE_DIR}/svac.cpp
     ${SOURCE_DIR}/SVACDecoder.cpp
     ${SOURCE_DIR}/TransferServer.cpp

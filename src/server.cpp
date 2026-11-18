@@ -49,6 +49,9 @@ using nlohmann::json;
 // 收流空闲超时（秒），0 表示不超时；由 config.ini 读取
 static int g_idleTimeoutSec = 0;
 
+// 证书目录（验签用，证书文件名为 {channel_id}_sign.cer）；由 config.ini 读取
+static std::string g_certDir = "./certs";
+
 // 从 config.ini 读取整型配置项（key=value，支持 # 注释），读不到返回默认值
 static int readConfigInt(const std::string &path, const std::string &key, int defaultValue)
 {
@@ -71,6 +74,32 @@ static int readConfigInt(const std::string &path, const std::string &key, int de
         if (trim(line.substr(0, pos)) == key) {
             std::string v = trim(line.substr(pos + 1));
             try { return std::stoi(v); } catch (...) { return defaultValue; }
+        }
+    }
+    return defaultValue;
+}
+
+// 从 config.ini 读取字符串配置项（key=value，支持 # 注释），读不到返回默认值
+static std::string readConfigString(const std::string &path, const std::string &key, const std::string &defaultValue)
+{
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) return defaultValue;
+
+    auto trim = [](std::string s) {
+        size_t b = s.find_first_not_of(" \t\r\n");
+        size_t e = s.find_last_not_of(" \t\r\n");
+        if (b == std::string::npos) return std::string();
+        return s.substr(b, e - b + 1);
+    };
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        size_t pos = line.find('#');
+        if (pos != std::string::npos) line = line.substr(0, pos);
+        pos = line.find('=');
+        if (pos == std::string::npos) continue;
+        if (trim(line.substr(0, pos)) == key) {
+            return trim(line.substr(pos + 1));
         }
     }
     return defaultValue;
@@ -206,6 +235,13 @@ static std::string parseCommonParams(const json &p, TransferConfig &cfg)
     cfg.bitrate = hasParam(p, "bitrate") ? toInt(getParam(p, "bitrate"), 2000000) : 2000000;
     cfg.idleTimeoutSec = g_idleTimeoutSec;
 
+    cfg.verify    = toBool(getParam(p, "verify"), false);
+    cfg.channelId = getParam(p, "channel_id").empty() ? getParam(p, "channelId") : getParam(p, "channel_id");
+    cfg.certDir   = g_certDir;
+    if (cfg.verify && cfg.channelId.empty()) {
+        return "missing channel_id when verify enabled";
+    }
+
     return "";
 }
 
@@ -275,6 +311,9 @@ int main(int argc, char *argv[])
     g_idleTimeoutSec = readConfigInt("config.ini", "idle_timeout", 0);
     BLOG(info) << "config.ini idle_timeout=" << g_idleTimeoutSec;
 
+    g_certDir = readConfigString("config.ini", "cert_dir", "./certs");
+    BLOG(info) << "config.ini cert_dir=" << g_certDir;
+
     std::map<uint32_t, std::unique_ptr<TransferServer>> transfers;
     std::mutex transfersMutex;
     std::atomic<uint32_t> nextId{1};
@@ -293,7 +332,8 @@ int main(int argc, char *argv[])
         BLOG(info) << "[HTTP] start: src_protocol=" << (cfg.protocol == Protocol::TCP ? "tcp" : "udp")
                    << " dst=" << cfg.dstIp << ":" << cfg.dstPort
                    << " decrypt=" << (cfg.decrypt ? "on" : "off")
-                   << " transcode=" << (cfg.transcode ? cfg.transcodeFormat : "off");
+                   << " transcode=" << (cfg.transcode ? cfg.transcodeFormat : "off")
+                   << " verify=" << (cfg.verify ? cfg.channelId : "off");
 
         uint32_t id = nextId.fetch_add(1);
         auto transfer = std::make_unique<TransferServer>();

@@ -55,6 +55,22 @@ bool TransferServer::start(const TransferConfig &cfg)
     _cfg = cfg;
     _pts = 0;
 
+    // ===== 初始化软验签器（独立于解密，尽早失败避免资源泄漏）=====
+    if (_cfg.verify && !_cfg.channelId.empty()) {
+        _signatureVerifier = std::make_unique<SignatureVerifier>();
+        _signatureVerifier->setResultCallback([](bool ok, const std::string &detail) {
+            if (ok)
+                BLOG(info) << "[SignatureVerifier] " << detail;
+            else
+                BLOG(warning) << "[SignatureVerifier] " << detail;
+        });
+        std::string certPath = _cfg.certDir + "/" + _cfg.channelId + "_sign.cer";
+        if (!_signatureVerifier->loadCertificate(certPath)) {
+            BLOG(error) << "[TransferServer] load verify cert failed: " << certPath;
+            return false;
+        }
+    }
+
     // ===== 第一步：尽早启动 NetworkReceiver，使 socket 进入监听状态 =====
     _networkReceiver = std::make_shared<NetworkReceiver>(_cfg.protocol, _cfg.recvIp, _cfg.recvPort);
     if (!_networkReceiver->start()) {
@@ -106,6 +122,10 @@ bool TransferServer::start(const TransferConfig &cfg)
         }
         _inputCodecid = codecid; // 记录输入编码类型
         bool keyFrame = (flags & MPEG_FLAG_IDR_FRAME) != 0;
+        // 软验签（独立于解密，喂原始 SVAC 流）
+        if (_signatureVerifier && codecid == PSI_STREAM_VIDEO_SVAC) {
+            _signatureVerifier->input(data, len);
+        }
         // 只有 SVAC 视频涉及加解密
         if (_cfg.decrypt && codecid == PSI_STREAM_VIDEO_SVAC) {
             _decryptor.input(data, len);

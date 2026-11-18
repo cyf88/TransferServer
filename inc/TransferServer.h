@@ -8,6 +8,7 @@
 #include "PSSender.h"
 #include "PsDemuxer.h"
 #include "RtpReceiver.h"
+#include "SignatureVerifier.h"
 #include "SVACDecoder.h"
 #include "YUVEncoder.h"
 #include "mpeg-ps.h"
@@ -56,6 +57,11 @@ struct TransferConfig {
     bool saveToFile = false;                 // 是否保存到文件（开启后不创建发送器）
     std::string recvFilePath;                // 接收流(PS)保存路径
     std::string outFilePath;                 // 解密/转码后裸流(ES)保存路径
+
+    // ===== 流验签（软验签）=====
+    bool verify = false;                     // 是否验签
+    std::string channelId;                   // 通道 ID（证书名 = channel_id_sign.cer）
+    std::string certDir;                     // 证书目录（来自 config.ini）
 };
 
 /**
@@ -116,6 +122,7 @@ private:
     std::unique_ptr<PSSender> _psSender;
     std::unique_ptr<FramePool> _framePool;
     std::unique_ptr<YUVEncoder> _yuvEncoder;
+    std::unique_ptr<SignatureVerifier> _signatureVerifier; // 软验签器
 
     std::atomic<bool> _running{false};
     std::thread _sendThread;
