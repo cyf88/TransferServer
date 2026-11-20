@@ -51,6 +51,12 @@ SVACDecoder::~SVACDecoder() {
    //中星微的库不支持初始化，所以注释掉
    // g_pfZXSVACDec_UnInit();
    
+	// 必须关闭解码句柄，否则库内部线程与缓冲区不会释放（每路会残留约 10 个线程和大量内存）
+	if (_vdCtx.video_decode_handle != (HANDLE)-1 && g_pfZXSVACDec_Close) {
+		g_pfZXSVACDec_Close(_vdCtx.video_decode_handle);
+		_vdCtx.video_decode_handle = (HANDLE)-1;
+	}
+
 	SAFE_DELETE_ARRAY(_vdCtx.m_yuv_buf);
 	SAFE_DELETE_ARRAY(_vdCtx.m_buf_org);
 	SAFE_DELETE_ARRAY(_vdCtx.m_svc_buf_org);
@@ -156,6 +162,11 @@ bool SVACDecoder::openDecodeHandle(const char *input, size_t inputSize, VideoDec
     }
     if (memcmp(&(vdCtx->svac_param), &param, sizeof(SVAC_PREFETCH_PARAM)) != 0) {
         // I帧参数有变化,需要重新创建上下文
+        // 先关闭旧句柄，否则会泄漏一套解码线程和内部缓冲
+        if (vdCtx->video_decode_handle != (HANDLE)-1 && g_pfZXSVACDec_Close) {
+            g_pfZXSVACDec_Close(vdCtx->video_decode_handle);
+            vdCtx->video_decode_handle = (HANDLE)-1;
+        }
         memcpy(&vdCtx->svac_param, &param, sizeof(SVAC_PREFETCH_PARAM));
         vdCtx->byte_per_sample = vdCtx->svac_param.bit_depth_luma == 8 ? 1 : 2;
         SAFE_DELETE_ARRAY(vdCtx->m_buf_org);
