@@ -178,6 +178,8 @@ GET /transfer/transcode
       "id": 1,
       "transcode_format": "h264",
       "input_format": "svac",
+      "encrypted": true,
+      "signed": true,
       "decrypt": true,
       "protocol": "tcp",
       "recv_ip": "127.0.0.1",
@@ -199,6 +201,8 @@ GET /transfer/transcode
 | `id` | 路唯一标识 |
 | `transcode_format` | 转码输出格式（`h264` / `h265`） |
 | `input_format` | 实际输入编码：`svac` / `h264` / `h265` / `unknown` |
+| `encrypted` | 原始码流是否加密：`true` / `false`；非 SVAC 或尚未解析出 NALU 时为 `null` |
+| `signed` | 原始码流是否带签名：`true` / `false`；非 SVAC 或尚未解析出 NALU 时为 `null` |
 | `decrypt` | 是否开启解密 |
 | `protocol` | 输入传输协议（`tcp` / `udp`） |
 | `recv_ip` / `recv_port` | 输入监听地址与实际收流端口 |
@@ -231,6 +235,9 @@ GET  /transfer/save
 | `vkek` | string | 否 | - | 解密密钥（同 `/transfer/start`） |
 | `vkek_version` | string | 否 | `1.0` | 密钥版本 |
 | `fps` / `bitrate` | int | 否 | 同 `/transfer/start` | 转码参数 |
+| `verify` | bool | 否 | `false` | 是否软验签（GB/T 35114） |
+| `channel_id` | string | 否 | - | 通道 ID（用于记录/日志） |
+| `cert_id` | string | 否 | - | 验签证书 ID，对应 `{cert_dir}/{cert_id}_sign.cer`；未传或为空时回退使用 `channel_id` |
 
 ### 请求示例
 
@@ -263,6 +270,70 @@ curl -X POST http://127.0.0.1:8080/transfer/save \
 | `recv_file` / `out_file` | 实际保存路径 |
 
 > 说明：`out_file` 保存的是裸 ES 流——仅解密时为解密后的 SVAC 裸流，转码时为 H.264/H.265 裸流。
+
+---
+
+## 6. 查询验签结果
+
+```
+GET /transfer/verify
+GET /transfer/verify?id=N
+```
+
+查询开启验签（`verify=true`）的转发路及其验签统计。不带 `id` 返回全部开启验签的路，带 `id` 返回指定路。
+
+### 响应（不带 id）
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "transfers": [
+    {
+      "id": 1,
+      "channel_id": "13100000001182000223",
+      "verify": {
+        "enabled": true,
+        "result": "success",
+        "detail": "verify success",
+        "success": 12,
+        "fail": 0,
+        "last_time": "2026-11-20T13:58:57"
+      }
+    }
+  ]
+}
+```
+
+### 响应（带 id）
+
+```json
+{"ok": true, "id": 1, "verify": {...}}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 该路是否开启验签 |
+| `result` | 最近一次验签结果：`success` / `fail`；尚未验到 AUTH 单元时为 `null` |
+| `detail` | 最近一次的详细结果文本 |
+| `success` / `fail` | 累计验签成功 / 失败次数 |
+| `last_time` | 最近一次验签时间（本地时间） |
+
+指定 `id` 不存在或已停止时返回 HTTP 404。
+
+---
+
+## 7. 查询验签证书
+
+```
+GET /transfer/certs
+```
+
+列出 `cert_dir` 下所有 `*_sign.cer` 的证书 ID（去掉 `_sign.cer` 后缀）。
+
+```json
+{"ok": true, "count": 2, "certs": ["13100000001181000223", "13100000001182000223"]}
+```
 
 ---
 

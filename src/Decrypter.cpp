@@ -143,6 +143,15 @@ void Decrypter::processNalu(const svac_nalu_t &svacNalu)
     nalu->authentication_idc = bs_read_f(b, 1);
     // bs_free(b)
 
+    // 记录原始码流的安全标志（解密不影响这两个标志位）
+    _naluSeen = true;
+    if (nalu->encryption_idc == 1) {
+        _decryptContext.encrypt_flag = true;
+    }
+    if (nalu->authentication_idc == 1 || nalu->nal_unit_type == NAL_AUTH) {
+        _decryptContext.authentication_flag = true;
+    }
+
     // 根据 NALU 类型进行处理
     switch (nalu->nal_unit_type) {
         case NAL_SPS:

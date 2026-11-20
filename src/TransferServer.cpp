@@ -1,13 +1,62 @@
 #include "TransferServer.h"
 #include "logger.h"
+#include "svac.h"
 
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 namespace {
 const int kFramePoolCapacity = 100;
 const int kPtsIncrement      = 3600; // 90kHz / 25fps
+
+// 从 SVAC ES 的 NALU 头解析安全标志：
+// 头字节 bit1 = encryption_idc，bit0 = authentication_idc
+struct SvacSecFlags {
+    bool sawNalu   = false;
+    bool encrypted = false;
+    bool signedFlag = false;
+};
+
+SvacSecFlags detectSvacSecurity(const uint8_t *data, size_t len)
+{
+    SvacSecFlags ret;
+    if (!data || len < 5) {
+        return ret;
+    }
+    size_t i = 0;
+    while (i + 4 <= len) {
+        if (data[i] != 0x00 || data[i + 1] != 0x00) {
+            ++i;
+            continue;
+        }
+        size_t scLen = 0;
+        if (data[i + 2] == 0x01) {
+            scLen = 3;
+        } else if (i + 4 <= len && data[i + 2] == 0x00 && data[i + 3] == 0x01) {
+            scLen = 4;
+        } else {
+            ++i;
+            continue;
+        }
+        size_t hdrPos = i + scLen;
+        if (hdrPos >= len) {
+            break;
+        }
+        uint8_t hdr      = data[hdrPos];
+        int nalType      = (hdr >> 2) & 0x0F;
+        if (hdr & 0x02) {
+            ret.encrypted = true;
+        }
+        if ((hdr & 0x01) || nalType == NAL_AUTH) {
+            ret.signedFlag = true;
+        }
+        ret.sawNalu = true;
+        i = hdrPos + 1;
+    }
+    return ret;
+}
 
 // 支持的视频编码类型（音频/其他流忽略）
 bool isVideoCodec(int codecid)
@@ -54,19 +103,34 @@ bool TransferServer::start(const TransferConfig &cfg)
 
     _cfg = cfg;
     _pts = 0;
+    _lastError.clear();
 
     // ===== 初始化软验签器（独立于解密，尽早失败避免资源泄漏）=====
-    if (_cfg.verify && !_cfg.channelId.empty()) {
+    if (_cfg.verify) {
+        if (_cfg.certId.empty()) {
+            _cfg.certId = _cfg.channelId; // cert_id 缺省时回退到 channel_id
+        }
+        if (_cfg.certId.empty()) {
+            _lastError = "missing cert_id/channel_id for verify";
+            BLOG(error) << "[TransferServer] " << _lastError;
+            return false;
+        }
         _signatureVerifier = std::make_unique<SignatureVerifier>();
-        _signatureVerifier->setResultCallback([](bool ok, const std::string &detail) {
+        _signatureVerifier->setResultCallback([this](bool ok, const std::string &detail) {
+            recordVerifyResult(ok, detail);
             if (ok)
                 BLOG(info) << "[SignatureVerifier] " << detail;
             else
                 BLOG(warning) << "[SignatureVerifier] " << detail;
         });
-        std::string certPath = _cfg.certDir + "/" + _cfg.channelId + "_sign.cer";
+        {
+            std::lock_guard<std::mutex> lk(_verifyMutex);
+            _verifyStats.enabled = true;
+        }
+        std::string certPath = _cfg.certDir + "/" + _cfg.certId + "_sign.cer";
         if (!_signatureVerifier->loadCertificate(certPath)) {
-            BLOG(error) << "[TransferServer] load verify cert failed: " << certPath;
+            _lastError = "load verify cert failed: " + certPath;
+            BLOG(error) << "[TransferServer] " << _lastError;
             return false;
         }
     }
@@ -74,7 +138,8 @@ bool TransferServer::start(const TransferConfig &cfg)
     // ===== 第一步：尽早启动 NetworkReceiver，使 socket 进入监听状态 =====
     _networkReceiver = std::make_shared<NetworkReceiver>(_cfg.protocol, _cfg.recvIp, _cfg.recvPort);
     if (!_networkReceiver->start()) {
-        BLOG(error) << "[TransferServer] NetworkReceiver start failed";
+        _lastError = "network receiver start failed";
+        BLOG(error) << "[TransferServer] " << _lastError;
         return false;
     }
 
@@ -129,7 +194,13 @@ bool TransferServer::start(const TransferConfig &cfg)
         // 只有 SVAC 视频涉及加解密
         if (_cfg.decrypt && codecid == PSI_STREAM_VIDEO_SVAC) {
             _decryptor.input(data, len);
+            // 解密器在解密前已解析原始 NALU 头，可直接得到加密/签名标志
+            observeSecurity(_decryptor.hasFrameInfo(), _decryptor.streamEncrypted(), _decryptor.streamSigned());
         } else {
+            if (codecid == PSI_STREAM_VIDEO_SVAC) {
+                SvacSecFlags sec = detectSvacSecurity(data, len);
+                observeSecurity(sec.sawNalu, sec.encrypted, sec.signedFlag);
+            }
             onVideoFrame(codecid, const_cast<uint8_t *>(data), len, keyFrame);
         }
     });
@@ -168,6 +239,8 @@ bool TransferServer::start(const TransferConfig &cfg)
 void TransferServer::stop()
 {
     bool wasRunning = _running.exchange(false);
+    _stoppedMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count());
     if (_networkReceiver)
         _networkReceiver->stop();
     if (_sendThread.joinable())
@@ -246,6 +319,50 @@ void TransferServer::closeSaveFiles()
         fclose(_outFile);
         _outFile = nullptr;
     }
+}
+
+void TransferServer::observeSecurity(bool sawNalu, bool encrypted, bool signedFlag)
+{
+    if (!sawNalu) {
+        return;
+    }
+    if (encrypted) {
+        _inputEncrypted.store(1);
+    } else if (_inputEncrypted.load() < 0) {
+        _inputEncrypted.store(0);
+    }
+    if (signedFlag) {
+        _inputSigned.store(1);
+    } else if (_inputSigned.load() < 0) {
+        _inputSigned.store(0);
+    }
+}
+
+void TransferServer::recordVerifyResult(bool ok, const std::string &detail)
+{
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char buf[32] = {0};
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmv);
+
+    std::lock_guard<std::mutex> lk(_verifyMutex);
+    _verifyStats.enabled   = true;
+    _verifyStats.hasResult = true;
+    _verifyStats.lastOk    = ok;
+    _verifyStats.detail    = detail;
+    _verifyStats.lastTime  = buf;
+    if (ok) {
+        ++_verifyStats.success;
+    } else {
+        ++_verifyStats.fail;
+    }
+}
+
+TransferServer::VerifySnapshot TransferServer::verifyInfo() const
+{
+    std::lock_guard<std::mutex> lk(_verifyMutex);
+    return _verifyStats;
 }
 
 void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool keyFrame)

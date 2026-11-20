@@ -32,14 +32,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 using nlohmann::json;
@@ -237,9 +240,14 @@ static std::string parseCommonParams(const json &p, TransferConfig &cfg)
 
     cfg.verify    = toBool(getParam(p, "verify"), false);
     cfg.channelId = getParam(p, "channel_id").empty() ? getParam(p, "channelId") : getParam(p, "channel_id");
+    cfg.certId    = getParam(p, "cert_id").empty() ? getParam(p, "certId") : getParam(p, "cert_id");
     cfg.certDir   = g_certDir;
-    if (cfg.verify && cfg.channelId.empty()) {
-        return "missing channel_id when verify enabled";
+    // cert_id 未传或为空时，用 channel_id 查找证书
+    if (cfg.certId.empty()) {
+        cfg.certId = cfg.channelId;
+    }
+    if (cfg.verify && cfg.certId.empty()) {
+        return "missing channel_id/cert_id when verify enabled";
     }
 
     return "";
@@ -338,7 +346,9 @@ int main(int argc, char *argv[])
         uint32_t id = nextId.fetch_add(1);
         auto transfer = std::make_unique<TransferServer>();
         if (!transfer->start(cfg)) {
-            reply(res, 500, {{"ok", false}, {"error", "transfer start failed"}});
+            std::string err = transfer->lastError();
+            if (err.empty()) err = "transfer start failed";
+            reply(res, 500, {{"ok", false}, {"error", err}});
             return;
         }
 
@@ -415,10 +425,16 @@ int main(int argc, char *argv[])
             if (!t || !t->isRunning()) continue;
             const TransferConfig &c = t->config();
             if (!c.transcode) continue; // 只返回转码路
+            json encrypted = nullptr;
+            if (t->inputEncrypted() >= 0) encrypted = (t->inputEncrypted() != 0);
+            json signedFlag = nullptr;
+            if (t->inputSigned() >= 0) signedFlag = (t->inputSigned() != 0);
             arr.push_back({
                 {"id", kv.first},
                 {"transcode_format", c.transcodeFormat},
                 {"input_format", inputFormatString(t->inputCodecid())},
+                {"encrypted", encrypted},
+                {"signed", signedFlag},
                 {"decrypt", c.decrypt},
                 {"protocol", c.protocol == Protocol::TCP ? "tcp" : "udp"},
                 {"recv_ip", c.recvIp},
@@ -433,6 +449,71 @@ int main(int argc, char *argv[])
             });
         }
         reply(res, 200, {{"ok", true}, {"count", arr.size()}, {"transfers", arr}});
+    };
+
+    // 验签结果：GET /transfer/verify[?id=N]
+    auto verifyJson = [](const TransferServer *t) {
+        TransferServer::VerifySnapshot v = t->verifyInfo();
+        json item = {
+            {"enabled", v.enabled},
+            {"detail", v.detail},
+            {"success", v.success},
+            {"fail", v.fail},
+            {"last_time", v.lastTime},
+        };
+        if (v.hasResult) {
+            item["result"] = v.lastOk ? "success" : "fail";
+        } else {
+            item["result"] = nullptr;
+        }
+        return item;
+    };
+
+    auto onVerify = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
+        std::lock_guard<std::mutex> lk(transfersMutex);
+        if (req.has_param("id")) {
+            uint32_t id = static_cast<uint32_t>(strtoul(req.get_param_value("id").c_str(), nullptr, 0));
+            auto it = transfers.find(id);
+            if (it == transfers.end() || !it->second || !it->second->isRunning()) {
+                reply(res, 404, {{"ok", false}, {"error", "transfer not found"}});
+                return;
+            }
+            reply(res, 200, {{"ok", true}, {"id", id}, {"verify", verifyJson(it->second.get())}});
+            return;
+        }
+        json arr = json::array();
+        for (const auto &kv : transfers) {
+            const TransferServer *t = kv.second.get();
+            if (!t || !t->isRunning()) continue;
+            const TransferConfig &c = t->config();
+            if (!c.verify) continue;
+            arr.push_back({
+                {"id", kv.first},
+                {"channel_id", c.channelId},
+                {"verify", verifyJson(t)},
+            });
+        }
+        reply(res, 200, {{"ok", true}, {"count", arr.size()}, {"transfers", arr}});
+    };
+
+    auto onCerts = [&](const httplib::Request &req, httplib::Response &res) {
+        BLOG(info) << "[HTTP] " << req.method << " " << req.path;
+        json arr = json::array();
+        DIR *dir = opendir(g_certDir.c_str());
+        if (dir) {
+            const std::string suffix = "_sign.cer";
+            struct dirent *ent = nullptr;
+            while ((ent = readdir(dir)) != nullptr) {
+                std::string name = ent->d_name;
+                if (name.size() > suffix.size() &&
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    arr.push_back(name.substr(0, name.size() - suffix.size()));
+                }
+            }
+            closedir(dir);
+        }
+        reply(res, 200, {{"ok", true}, {"count", arr.size()}, {"certs", arr}});
     };
 
     auto onSave = [&](const httplib::Request &req, httplib::Response &res) {
@@ -453,7 +534,9 @@ int main(int argc, char *argv[])
         uint32_t id = nextId.fetch_add(1);
         auto transfer = std::make_unique<TransferServer>();
         if (!transfer->start(cfg)) {
-            reply(res, 500, {{"ok", false}, {"error", "transfer start failed"}});
+            std::string err = transfer->lastError();
+            if (err.empty()) err = "transfer start failed";
+            reply(res, 500, {{"ok", false}, {"error", err}});
             return;
         }
 
@@ -481,6 +564,31 @@ int main(int argc, char *argv[])
     svr.Post("/transfer/stop", onStop);
     svr.Get("/transfer/status", onStatus);
     svr.Get("/transfer/transcode", onTranscode);
+    svr.Get("/transfer/verify", onVerify);
+    svr.Get("/transfer/certs", onCerts);
+
+    // 定期清理已停止超过 60 秒的转发对象，避免空闲超时后的对象长期驻留内存
+    constexpr int64_t kStoppedTransferTtlMs = 60 * 1000;
+    std::thread([&transfers, &transfersMutex]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::lock_guard<std::mutex> lk(transfersMutex);
+            for (auto it = transfers.begin(); it != transfers.end();) {
+                TransferServer *t = it->second.get();
+                if (t && !t->isRunning()) {
+                    int64_t stoppedAt = t->stoppedMs();
+                    if (stoppedAt > 0 && nowMs - stoppedAt >= kStoppedTransferTtlMs) {
+                        BLOG(info) << "[HTTP] prune stopped transfer id=" << it->first;
+                        it = transfers.erase(it);
+                        continue;
+                    }
+                }
+                ++it;
+            }
+        }
+    }).detach();
 
     BLOG(info) << "TransferServer HTTP listening on port " << httpPort;
     if (!svr.listen("0.0.0.0", httpPort)) {

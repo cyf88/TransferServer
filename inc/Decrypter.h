@@ -34,8 +34,8 @@ typedef struct {
     std::string stream_id;
     std::string stream_vkek_version;
     VKEKInfo vkek_info;
-    bool encrypt_flag;
-    bool authentication_flag;
+    bool encrypt_flag         = false;
+    bool authentication_flag  = false;
     bool is_key_frame = false;
 
     unsigned char iv[16];
@@ -102,6 +102,15 @@ public:
      */
     bool input(const uint8_t *encryptFrameData, size_t frameLength);
 
+    /** 是否已解析到至少一个 NALU（此时加密/签名标志才有意义） */
+    bool hasFrameInfo() const { return _naluSeen; }
+
+    /** 原始码流是否加密（NALU 头 encryption_idc == 1） */
+    bool streamEncrypted() const { return _decryptContext.encrypt_flag; }
+
+    /** 原始码流是否带签名（NALU 头 authentication_idc == 1 或存在 AUTH NALU） */
+    bool streamSigned() const { return _decryptContext.authentication_flag; }
+
 private:
     /**
      * 处理单个 NALU 单元
@@ -131,6 +140,7 @@ private:
 
     svac_stream_t *_hSvac;
     DecryptContext _decryptContext;
+    bool _naluSeen = false;
 
 
 };
