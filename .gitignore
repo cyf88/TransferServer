@@ -1,6 +1,13 @@
 # Build
 build/
 cmake-build-*/
+deploy/run/
+deploy/*.tar
+deploy/TransferServer
+deploy/certs/
+deploy/sdk/
+deploy.zip
+TransferServer.log
 
 # Compiled objects & libraries
 *.o

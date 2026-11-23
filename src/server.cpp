@@ -313,8 +313,13 @@ static const char *inputFormatString(int codecid)
 
 int main(int argc, char *argv[])
 {
-    int httpPort = 8080;
-    if (argc >= 2) httpPort = atoi(argv[1]);
+    // HTTP 端口：优先 config.ini 的 http_port，其次命令行参数，最后默认 8080
+    int httpPort = argc >= 2 ? atoi(argv[1]) : 8080;
+    int cfgPort  = readConfigInt("config.ini", "http_port", 0);
+    if (cfgPort > 0 && cfgPort <= 65535) {
+        httpPort = cfgPort;
+        BLOG(info) << "config.ini http_port=" << httpPort;
+    }
 
     g_idleTimeoutSec = readConfigInt("config.ini", "idle_timeout", 0);
     BLOG(info) << "config.ini idle_timeout=" << g_idleTimeoutSec;
