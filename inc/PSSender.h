@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -32,7 +33,8 @@ public:
 
 private:
     bool createSocket();
-    bool sendRtpPacket(const uint8_t *buf, size_t len); // 含 TCP 长度前缀处理
+    bool sendPacket(const uint8_t *buf, size_t len);     // 实际发送（含 TCP 长度前缀处理）
+    bool sendRtpPacket(const uint8_t *buf, size_t len);  // 发送并记录失败标志
 
     // ps_muxer 回调
     static void *psAlloc(void *param, size_t bytes);
@@ -63,6 +65,7 @@ private:
 
     void *_rtpEncoder{nullptr};
     uint64_t _currentPts{0};
+    std::atomic<bool> _sendFailed{false}; // 本次 sendData 内是否发生过发送失败
 };
 
 #endif // PSSENDER_H

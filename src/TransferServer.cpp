@@ -11,6 +11,13 @@ namespace {
 const int kFramePoolCapacity = 100;
 const int kPtsIncrement      = 3600; // 90kHz / 25fps
 
+int64_t steadyNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // 从 SVAC ES 的 NALU 头解析安全标志：
 // 头字节 bit1 = encryption_idc，bit0 = authentication_idc
 struct SvacSecFlags {
@@ -250,6 +257,44 @@ void TransferServer::stop()
         BLOG(info) << "[TransferServer] stopped";
 }
 
+bool TransferServer::sendOut(const uint8_t *data, size_t len, EPSI_STREAM_TYPE streamType, bool keyFrame)
+{
+    if (!_psSender) {
+        return true;
+    }
+    _pts += kPtsIncrement;
+    bool ok = _psSender->sendData(data, len, streamType, _pts, _pts, keyFrame);
+    noteSendResult(ok);
+    return ok;
+}
+
+void TransferServer::noteSendResult(bool ok)
+{
+    if (ok) {
+        _sendFailStreak.store(0);
+        _firstSendFailMs.store(0);
+        return;
+    }
+
+    int64_t now   = steadyNowMs();
+    int64_t first = _firstSendFailMs.load();
+    if (first == 0) {
+        _firstSendFailMs.store(now);
+        first = now;
+    }
+    int streak = _sendFailStreak.fetch_add(1) + 1;
+
+    bool hitFrames  = _cfg.sendFailFrames > 0 && streak >= _cfg.sendFailFrames;
+    bool hitSeconds = _cfg.sendFailSeconds > 0 &&
+                      now - first >= static_cast<int64_t>(_cfg.sendFailSeconds) * 1000;
+
+    if (!_outputFailed.load() && (hitFrames || hitSeconds)) {
+        _outputFailed.store(true);
+        BLOG(warning) << "[TransferServer] 输出连续发送失败 streak=" << streak
+                      << " 持续=" << (now - first) << "ms，标记为不可达，等待自动停止";
+    }
+}
+
 void TransferServer::watchdogLoop()
 {
     while (_running) {
@@ -383,10 +428,7 @@ void TransferServer::onVideoFrame(int codecid, uint8_t *data, size_t len, bool k
     if (!needTranscode) {
         // 透传：保存裸流(ES) + (可选) 按原始编码重新封装推送
         writeOutStream(data, len);
-        if (!_psSender)
-            return;
-        _pts += kPtsIncrement;
-        _psSender->sendData(data, len, static_cast<EPSI_STREAM_TYPE>(codecid), _pts, _pts, keyFrame);
+        sendOut(data, len, static_cast<EPSI_STREAM_TYPE>(codecid), keyFrame);
         return;
     }
 
@@ -469,12 +511,7 @@ void TransferServer::sendLoop()
                         return;
                     // 保存转码后的裸流(ES)
                     writeOutStream(encoded.data.data(), encoded.data.size());
-                    if (!_psSender)
-                        return;
-                    std::vector<uint8_t> buf(encoded.data.size());
-                    memcpy(buf.data(), encoded.data.data(), encoded.data.size());
-                    _pts += kPtsIncrement;
-                    _psSender->sendData(buf.data(), buf.size(), streamType, _pts, _pts, encoded.keyFrame);
+                    sendOut(encoded.data.data(), encoded.data.size(), streamType, encoded.keyFrame);
                 });
                 encoderCallbackSet = true;
             }

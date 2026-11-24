@@ -135,9 +135,14 @@ bool PSSender::sendData(const uint8_t *pData, size_t dataSize, EPSI_STREAM_TYPE 
 
     int flags = isKeyFrame ? MPEG_FLAG_IDR_FRAME : 0;
     _currentPts = pts;
+    _sendFailed.store(false);
     int r = ps_muxer_input(_psMuxer, _stream, flags, static_cast<int64_t>(pts), static_cast<int64_t>(dts), pData, dataSize);
     if (r != 0) {
         BLOG(error) << "[PSSender] ps_muxer_input failed, r=" << r;
+        return false;
+    }
+    // ps_muxer_input 不一定向上传递 RTP 回调的失败结果，这里以实际发送结果为准
+    if (_sendFailed.load()) {
         return false;
     }
     return true;
@@ -173,6 +178,15 @@ bool PSSender::createSocket()
 }
 
 bool PSSender::sendRtpPacket(const uint8_t *buf, size_t len)
+{
+    bool ok = sendPacket(buf, len);
+    if (!ok) {
+        _sendFailed.store(true);
+    }
+    return ok;
+}
+
+bool PSSender::sendPacket(const uint8_t *buf, size_t len)
 {
     if (_protocol == Protocol::TCP) {
         // RTSP 交织式：2 字节长度域 + RTP 包

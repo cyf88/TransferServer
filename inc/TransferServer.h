@@ -51,6 +51,10 @@ struct TransferConfig {
     int bitrate = 2000000;
     int idleTimeoutSec = 0;   // 收流空闲超时（秒），0 表示不超时
 
+    // ===== 输出保护 =====
+    int sendFailFrames  = 100; // 连续发送失败帧数阈值，0 表示不启用
+    int sendFailSeconds = 5;   // 连续发送失败持续秒数阈值，0 表示不启用
+
     // ===== SVAC 解码库路径（转码时使用）=====
     std::string decoderLibPath = "./sdk/libZXSvacDec.so";
 
@@ -106,6 +110,9 @@ public:
     /** 原始输入码流是否带签名：-1 未知，0 否，1 是（仅 SVAC 有效） */
     int inputSigned() const { return _inputSigned.load(); }
 
+    /** 输出是否已连续发送失败达到阈值（由服务端后台线程据此自动停止该路） */
+    bool outputFailed() const { return _outputFailed.load(); }
+
     /** 验签结果快照 */
     struct VerifySnapshot {
         bool enabled    = false;
@@ -143,6 +150,12 @@ private:
     /** 空闲超时看门狗线程：收流空闲超过 idleTimeoutSec 则自动停止 */
     void watchdogLoop();
 
+    /** 封装 PSSender 发送：累计连续失败次数，达到阈值时置位 _outputFailed */
+    bool sendOut(const uint8_t *data, size_t len, EPSI_STREAM_TYPE streamType, bool keyFrame);
+
+    /** 记录一次输出发送结果 */
+    void noteSendResult(bool ok);
+
 private:
     TransferConfig _cfg;
 
@@ -178,6 +191,11 @@ private:
     // ===== 空闲超时 =====
     std::atomic<int64_t> _lastRecvMs{0}; // 最近一次收流时间（毫秒）
     std::thread _watchdogThread;          // 空闲超时看门狗线程
+
+    // ===== 输出发送状态（连续失败保护）=====
+    std::atomic<int> _sendFailStreak{0};     // 连续发送失败次数
+    std::atomic<int64_t> _firstSendFailMs{0}; // 本轮连续失败开始时间（毫秒）
+    std::atomic<bool> _outputFailed{false};   // 是否已判定输出不可达
 
     // ===== 文件保存（saveToFile 模式）=====
     std::FILE *_recvFile = nullptr; // 接收流(PS)文件句柄

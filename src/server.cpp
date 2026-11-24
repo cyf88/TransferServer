@@ -52,6 +52,10 @@ using nlohmann::json;
 // 收流空闲超时（秒），0 表示不超时；由 config.ini 读取
 static int g_idleTimeoutSec = 0;
 
+// 输出保护：连续发送失败帧数 / 持续秒数，0 表示不启用该项；由 config.ini 读取
+static int g_sendFailFrames  = 100;
+static int g_sendFailSeconds = 5;
+
 // 证书目录（验签用，证书文件名为 {channel_id}_sign.cer）；由 config.ini 读取
 static std::string g_certDir = "./certs";
 
@@ -237,6 +241,8 @@ static std::string parseCommonParams(const json &p, TransferConfig &cfg)
     cfg.fps     = hasParam(p, "fps") ? toInt(getParam(p, "fps"), 25) : 25;
     cfg.bitrate = hasParam(p, "bitrate") ? toInt(getParam(p, "bitrate"), 2000000) : 2000000;
     cfg.idleTimeoutSec = g_idleTimeoutSec;
+    cfg.sendFailFrames  = g_sendFailFrames;
+    cfg.sendFailSeconds = g_sendFailSeconds;
 
     cfg.verify    = toBool(getParam(p, "verify"), false);
     cfg.channelId = getParam(p, "channel_id").empty() ? getParam(p, "channelId") : getParam(p, "channel_id");
@@ -323,6 +329,11 @@ int main(int argc, char *argv[])
 
     g_idleTimeoutSec = readConfigInt("config.ini", "idle_timeout", 0);
     BLOG(info) << "config.ini idle_timeout=" << g_idleTimeoutSec;
+
+    g_sendFailFrames = readConfigInt("config.ini", "send_fail_frames", 100);
+    BLOG(info) << "config.ini send_fail_frames=" << g_sendFailFrames;
+    g_sendFailSeconds = readConfigInt("config.ini", "send_fail_seconds", 5);
+    BLOG(info) << "config.ini send_fail_seconds=" << g_sendFailSeconds;
 
     g_certDir = readConfigString("config.ini", "cert_dir", "./certs");
     BLOG(info) << "config.ini cert_dir=" << g_certDir;
@@ -572,16 +583,23 @@ int main(int argc, char *argv[])
     svr.Get("/transfer/verify", onVerify);
     svr.Get("/transfer/certs", onCerts);
 
-    // 定期清理已停止超过 60 秒的转发对象，避免空闲超时后的对象长期驻留内存
+    // 后台巡检（每秒）：
+    //   1) 输出连续发送失败、判定上级不可达的转发路，自动停止；
+    //   2) 清理已停止超过 60 秒的转发对象，避免长期驻留内存。
     constexpr int64_t kStoppedTransferTtlMs = 60 * 1000;
     std::thread([&transfers, &transfersMutex]() {
         while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            std::this_thread::sleep_for(std::chrono::seconds(1));
             int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
             std::lock_guard<std::mutex> lk(transfersMutex);
             for (auto it = transfers.begin(); it != transfers.end();) {
                 TransferServer *t = it->second.get();
+                if (t && t->isRunning() && t->outputFailed()) {
+                    BLOG(warning) << "[HTTP] transfer id=" << it->first
+                                  << " 输出连续发送失败，自动停止";
+                    t->stop();
+                }
                 if (t && !t->isRunning()) {
                     int64_t stoppedAt = t->stoppedMs();
                     if (stoppedAt > 0 && nowMs - stoppedAt >= kStoppedTransferTtlMs) {
