@@ -48,7 +48,8 @@ GET  /transfer/start
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|:----:|--------|------|
-| `src_protocol` | string | 是 | - | 输入传输协议：`tcp` / `udp`（收流端口始终自动分配） |
+| `src_protocol` | string | 是 | - | 输入传输协议：`tcp` / `udp` |
+| `recv_port` | int | 否 | `0` | 收流端口，由调用者指定；`0` 或省略时由内核自动分配（指定端口被占用则启动失败） |
 | `dst_ip` | string | 是 | - | 输出目标 IP |
 | `dst_port` | int | 是 | - | 输出目标端口 |
 | `out_protocol` | string | 否 | `tcp` | 输出传输协议：`tcp` / `udp` |
@@ -75,6 +76,7 @@ curl -X POST http://127.0.0.1:8080/transfer/start \
   -H "Content-Type: application/json" \
   -d '{
         "src_protocol": "tcp",
+        "recv_port": 5000,
         "dst_ip": "192.168.1.1",
         "dst_port": 554,
         "out_protocol": "tcp",
@@ -109,7 +111,7 @@ curl -X POST "http://127.0.0.1:8080/transfer/start?src_protocol=udp&dst_ip=192.1
 | `ok` | 固定 `true` |
 | `status` | 固定 `started` |
 | `id` | 本路转发的唯一标识，供 `stop` / `status` 使用 |
-| `recv_port` | 实际收流端口（由服务自动分配） |
+| `recv_port` | 实际收流端口（调用者指定则原样返回，未指定则为内核自动分配） |
 
 ---
 
@@ -280,7 +282,8 @@ GET  /transfer/save
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|:----:|--------|------|
-| `src_protocol` | string | 是 | - | 输入传输协议：`tcp` / `udp`（收流端口始终自动分配） |
+| `src_protocol` | string | 是 | - | 输入传输协议：`tcp` / `udp` |
+| `recv_port` | int | 否 | `0` | 收流端口，由调用者指定；`0` 或省略时由内核自动分配 |
 | `recv_file` | string | 是 | - | 接收流（重组后的 PS）保存路径 |
 | `out_file` | string | 是 | - | 解密/转码后裸流（ES）保存路径 |
 | `decrypt` | bool | 否 | `false` | 是否解密（仅 SVAC 视频） |

@@ -145,7 +145,11 @@ bool TransferServer::start(const TransferConfig &cfg)
     // ===== 第一步：尽早启动 NetworkReceiver，使 socket 进入监听状态 =====
     _networkReceiver = std::make_shared<NetworkReceiver>(_cfg.protocol, _cfg.recvIp, _cfg.recvPort);
     if (!_networkReceiver->start()) {
-        _lastError = "network receiver start failed";
+        if (_cfg.recvPort != 0) {
+            _lastError = "bind recv_port " + std::to_string(_cfg.recvPort) + " failed (端口被占用或无权限)";
+        } else {
+            _lastError = "network receiver start failed";
+        }
         BLOG(error) << "[TransferServer] " << _lastError;
         return false;
     }

@@ -50,9 +50,11 @@ bool NetworkReceiver::createSocket() {
     setRecvBufSize(1024 * 1024 * 5);
     BLOG(info) << "[NetworkReceiver] recv buf size: " << _recvBufSize;
 
-    // 设置地址可复用
-    int opt = 1;
-    setsockopt(_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // 设置地址可复用（UDP 指定端口时不能开启，否则同端口可被重复绑定）
+    if (_protocol == Protocol::TCP || _port == 0) {
+        int opt = 1;
+        setsockopt(_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
 
 
     // 设置接收缓冲区大小

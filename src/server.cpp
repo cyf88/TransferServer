@@ -225,7 +225,15 @@ static std::string parseCommonParams(const json &p, TransferConfig &cfg)
         return "invalid src_protocol, expect tcp or udp";
     }
     cfg.recvIp   = "";
-    cfg.recvPort = 0; // 始终由内核自动分配
+    // 收流端口由调用者指定；未传或为 0 时退回内核自动分配
+    std::string recvPort = getParam(p, "recv_port").empty() ? getParam(p, "recvPort") : getParam(p, "recv_port");
+    if (!recvPort.empty()) {
+        int port = toInt(recvPort, -1);
+        if (port < 0 || port > 65535) {
+            return "invalid recv_port, expect 1-65535";
+        }
+        cfg.recvPort = static_cast<uint16_t>(port);
+    }
 
     cfg.decrypt   = toBool(getParam(p, "decrypt"), false);
     cfg.transcode = toBool(getParam(p, "transcode"), false);
